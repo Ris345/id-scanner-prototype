@@ -1,10 +1,14 @@
 import { Platform } from 'react-native';
 import { ParsedID } from './idParser';
 
-const API_URL = 'https://id-scanner-prototype.onrender.com/'
+// Production: deployed backend on Render
+// Development: set your own backend URL below (run your own backend with your own AWS credentials)
+const API_URL = __DEV__
+  ? 'http://localhost:3001'
+  : 'https://id-scanner-prototype.onrender.com';
 
 /**
- * Send image to backend for ID extraction via OpenAI Vision
+ * Send image to backend for ID extraction via AWS Textract
  */
 export async function scanID(imageUri: string): Promise<ParsedID> {
   const base64Image = await imageToBase64(imageUri);

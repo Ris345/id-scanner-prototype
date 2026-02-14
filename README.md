@@ -1,50 +1,59 @@
-# Welcome to your Expo app 👋
+# ID Scanner
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+Scan government-issued IDs (driver's licenses, etc.) using your camera or photo gallery. Extracts name, date of birth, address, ID number, and state using AWS Textract.
 
-## Get started
+## Architecture
 
-1. Install dependencies
+- **Frontend:** Expo (React Native) — runs on iOS, Android, and web
+- **Backend:** Node.js/Express server that handles image processing and AWS Textract calls
+- **OCR:** AWS Textract AnalyzeID
 
-   ```bash
-   npm install
-   ```
+In development, the app hits a local backend (`localhost:3001`). In production, it points to the deployed backend on Render.
 
-2. Start the app
+## Development Setup
 
-   ```bash
-   npx expo start
-   ```
-
-In the output, you'll find options to open the app in a
-
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
-
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
+### 1. Backend
 
 ```bash
-npm run reset-project
+cd backend
+npm install
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+Create a `.env` file in the project root with **your own** AWS credentials:
 
-## Learn more
+```
+AWS_ACCESS_KEY_ID=your_key
+AWS_SECRET_ACCESS_KEY=your_secret
+AWS_REGION=us-east-1
+```
 
-To learn more about developing your project with Expo, look at the following resources:
+Start the backend:
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+```bash
+npm run dev
+```
 
-## Join the community
+The backend runs on `http://localhost:3001`.
 
-Join our community of developers creating universal apps.
+### 2. Frontend
 
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+```bash
+npm install
+npx expo start
+```
+
+Press `w` to open in the browser, or scan the QR code with Expo Go for mobile.
+
+**Important:** In dev mode, the app connects to `localhost:3001`. You must run your own backend with your own AWS credentials. The production Render backend is not for development use.
+
+## Production
+
+- **Live Demo:** [https://69910ad24cfd88129a76a10d--incomparable-donut-edf69d.netlify.app/](https://69910ad24cfd88129a76a10d--incomparable-donut-edf69d.netlify.app/)
+- **Backend** is deployed on [Render](https://render.com) at `https://id-scanner-prototype.onrender.com`
+- **Frontend** can be redeployed as a static web export to Netlify/Vercel:
+
+```bash
+npx expo export --platform web
+```
+
+This outputs to `dist/` which can be deployed to any static hosting provider.
