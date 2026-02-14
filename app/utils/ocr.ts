@@ -1,7 +1,7 @@
 import { Platform } from 'react-native';
 import { ParsedID } from './idParser';
 
-const API_URL = 'http://localhost:3001';
+const API_URL = 'https://id-scanner-prototype.onrender.com/'
 
 /**
  * Send image to backend for ID extraction via OpenAI Vision

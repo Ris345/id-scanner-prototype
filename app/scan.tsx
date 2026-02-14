@@ -1,7 +1,8 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useCallback } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, ActivityIndicator } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import type { CameraView as CameraViewType } from 'expo-camera';
+import { GestureDetector, Gesture } from 'react-native-gesture-handler';
 import * as ImagePicker from 'expo-image-picker';
 import { useRouter, Href } from 'expo-router';
 import { scanID } from './utils/ocr';
@@ -16,6 +17,21 @@ export default function Scan() {
   const [state, setState] = useState<ScanState>('camera');
   const [errorMsg, setErrorMsg] = useState('');
   const cameraRef = useRef<CameraViewType>(null);
+
+  // Zoom state: default 0.03 for a slight zoom to help with ID scanning
+  const DEFAULT_ZOOM = 0.03;
+  const [zoom, setZoom] = useState(DEFAULT_ZOOM);
+  const zoomAtPinchStart = useRef(DEFAULT_ZOOM);
+
+  const pinchGesture = Gesture.Pinch()
+    .onStart(() => {
+      zoomAtPinchStart.current = zoom;
+    })
+    .onUpdate((e) => {
+      // Scale the zoom relative to the starting value
+      const newZoom = zoomAtPinchStart.current * e.scale;
+      setZoom(Math.min(Math.max(newZoom, 0), 1));
+    });
 
   const processImage = async (uri: string) => {
     setState('processing');
@@ -46,7 +62,7 @@ export default function Scan() {
 
   const takePhoto = async () => {
     if (cameraRef.current) {
-      const photo = await cameraRef.current.takePictureAsync();
+      const photo = await cameraRef.current.takePictureAsync({ quality: 1 });
       if (photo) {
         await processImage(photo.uri);
       }
@@ -136,40 +152,42 @@ export default function Scan() {
   // Camera view
   return (
     <View style={styles.cameraContainer}>
-      <CameraView ref={cameraRef} style={styles.camera} facing="back">
-        <View style={styles.overlay}>
-          {/* Top bar */}
-          <View style={styles.topBar}>
-            <TouchableOpacity onPress={() => router.back()}>
-              <Text style={styles.cancelText}>Cancel</Text>
-            </TouchableOpacity>
-          </View>
-
-          {/* Scan frame */}
-          <View style={styles.frameContainer}>
-            <View style={styles.scanFrame}>
-              <View style={[styles.corner, styles.topLeft]} />
-              <View style={[styles.corner, styles.topRight]} />
-              <View style={[styles.corner, styles.bottomLeft]} />
-              <View style={[styles.corner, styles.bottomRight]} />
+      <GestureDetector gesture={pinchGesture}>
+        <CameraView ref={cameraRef} style={styles.camera} facing="back" zoom={zoom}>
+          <View style={styles.overlay}>
+            {/* Top bar */}
+            <View style={styles.topBar}>
+              <TouchableOpacity onPress={() => router.back()}>
+                <Text style={styles.cancelText}>Cancel</Text>
+              </TouchableOpacity>
             </View>
-            <Text style={styles.hint}>Position your ID within the frame</Text>
+
+            {/* Scan frame */}
+            <View style={styles.frameContainer}>
+              <View style={styles.scanFrame}>
+                <View style={[styles.corner, styles.topLeft]} />
+                <View style={[styles.corner, styles.topRight]} />
+                <View style={[styles.corner, styles.bottomLeft]} />
+                <View style={[styles.corner, styles.bottomRight]} />
+              </View>
+              <Text style={styles.hint}>Position your ID within the frame{'\n'}Pinch to zoom</Text>
+            </View>
+
+            {/* Bottom controls */}
+            <View style={styles.controls}>
+              <TouchableOpacity style={styles.galleryButton} onPress={pickImage}>
+                <Text style={styles.galleryText}>Gallery</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity style={styles.captureButton} onPress={takePhoto}>
+                <View style={styles.captureInner} />
+              </TouchableOpacity>
+
+              <View style={styles.placeholder} />
+            </View>
           </View>
-
-          {/* Bottom controls */}
-          <View style={styles.controls}>
-            <TouchableOpacity style={styles.galleryButton} onPress={pickImage}>
-              <Text style={styles.galleryText}>Gallery</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity style={styles.captureButton} onPress={takePhoto}>
-              <View style={styles.captureInner} />
-            </TouchableOpacity>
-
-            <View style={styles.placeholder} />
-          </View>
-        </View>
-      </CameraView>
+        </CameraView>
+      </GestureDetector>
     </View>
   );
 }

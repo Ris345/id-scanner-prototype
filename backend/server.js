@@ -4,10 +4,10 @@ const cors = require('cors');
 const { TextractClient, AnalyzeIDCommand } = require('@aws-sdk/client-textract');
 const sharp = require('sharp');
 const path = require('path');
-require('dotenv').config({ path: path.join(__dirname, '../.env') });
+try { require('dotenv').config({ path: path.join(__dirname, '../.env') }); } catch {}
 
 const app = express();
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
 
 if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
   console.error('AWS credentials not set in backend/.env');
@@ -133,7 +133,7 @@ function buildName(fields) {
   return full || fields['NAME'] || null;
 }
 
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`
 ID Scanner Backend
 ━━━━━━━━━━━━━━━━━━━━━━
