@@ -1,3 +1,4 @@
+
 // Universal ID Parser - extracts structured data from OCR text
 
 export interface ParsedID {
