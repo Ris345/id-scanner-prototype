@@ -1,0 +1,6 @@
+services:
+  python-ocr:
+    build: ./python-easy-ocr
+    ports:
+      - "3002:3002"
+    restart: unless-stopped

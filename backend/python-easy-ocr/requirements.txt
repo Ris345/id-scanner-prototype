@@ -1,0 +1,5 @@
+easyocr
+flask
+pillow
+numpy
+passporteye

@@ -1,77 +1,73 @@
 'use strict';
 
-const path = require('path');
-const { createWorker } = require('tesseract.js');
+const PYTHON_OCR_URL = process.env.PYTHON_OCR_URL || 'http://localhost:3002';
 
-let worker = null;
-
-async function initWorker() {
-  worker = await createWorker('eng', 1, {
-    langPath: path.join(__dirname, '..'),
-  });
-  console.log('Tesseract worker initialized');
-}
-
-// mrz v5 is ESM-only — use dynamic import from CJS
-let _mrzParse = null;
-async function getMrzParse() {
-  if (_mrzParse) return _mrzParse;
+async function isHealthy() {
   try {
-    const m = await import('mrz');
-    _mrzParse = typeof m.parse === 'function' ? m.parse : (m.default && m.default.parse) || null;
-  } catch (e) {
-    console.warn('mrz package unavailable:', e.message);
-    _mrzParse = false; // mark as unavailable so we don't retry
+    const res = await fetch(`${PYTHON_OCR_URL}/health`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    return res.ok;
+  } catch {
+    return false;
   }
-  return _mrzParse || null;
 }
 
-async function scanWithTesseract(imageBuffer) {
-  if (!worker) throw new Error('Tesseract worker not initialized');
+async function scanWithEasyOCR(imageBuffer) {
+  const base64 = imageBuffer.toString('base64');
 
-  const result = await worker.recognize(imageBuffer);
-  const { text, confidence } = result.data;
+  const res = await fetch(`${PYTHON_OCR_URL}/ocr`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ image: base64 }),
+    signal: AbortSignal.timeout(30000),
+  });
 
-  const rawText = text;
-  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Python OCR service error ${res.status}: ${body}`);
+  }
+
+  const ocrResult = await res.json();
+  if (!ocrResult.success) {
+    throw new Error(`Python OCR failed: ${ocrResult.error || 'unknown error'}`);
+  }
+
+  const rawText = ocrResult.raw_text;
+  const confidence = ocrResult.confidence;
+  const lines = (ocrResult.lines || []).map(l => l.text);
+
+  console.log(`[easyocrService] Python OCR confidence: ${confidence.toFixed(1)}%`);
+  console.log(`[easyocrService] Raw text received:\n${rawText}`);
 
   let data = null;
 
-  // Try MRZ lines (passports / ID cards with machine-readable zone)
-  const MRZ_PATTERN = /^[A-Z0-9<]{20,44}$/;
-  const mrzLines = lines.filter(l => MRZ_PATTERN.test(l.replace(/\s/g, '')));
+  // ── Path 1: PassportEye found an MRZ zone ────────────────────────────────
+  if (ocrResult.mrz) {
+    console.log('[easyocrService] MRZ detected — using PassportEye structured fields');
+    console.log('[easyocrService] MRZ raw fields:', JSON.stringify(ocrResult.mrz, null, 2));
 
-  if (mrzLines.length >= 2) {
-    const parse = await getMrzParse();
-    if (parse) {
-      try {
-        const mrzResult = parse(mrzLines.slice(0, 3));
-        const fields = mrzResult.fields || {};
+    const mrz = ocrResult.mrz;
+    const surname = (mrz.surname || '').replace(/</g, ' ').trim();
+    const givenNames = (mrz.given_names || '').replace(/</g, ' ').trim();
+    const name = [givenNames, surname].filter(Boolean).join(' ') || null;
 
-        if (mrzResult.valid || Object.values(fields).some(Boolean)) {
-          data = {
-            name: buildMrzName(fields),
-            dateOfBirth: convertMrzDate(fields.birthDate),
-            address: extractAddress(lines, text.toUpperCase()), // MRZ has no address; regex fallback
-            idNumber: fields.documentNumber ? fields.documentNumber.replace(/</g, '') : null,
-            state: fields.issuingState || null,
-          };
-        }
-      } catch (e) {
-        console.warn('mrz.parse failed:', e.message);
-      }
-    }
+    data = {
+      name,
+      dateOfBirth: convertMrzDate(mrz.date_of_birth),
+      address: null,
+      idNumber: (mrz.document_number || '').replace(/</g, '').trim() || null,
+      state: mrz.country || mrz.nationality || null,
+    };
 
-    // If mrz lib failed/unavailable, parse MRZ manually
-    if (!data) {
-      data = parseManualMRZ(mrzLines);
-    }
+    console.log('[easyocrService] Parsed from MRZ:', JSON.stringify(data, null, 2));
   }
 
-  // No MRZ found — fall back to regex parsers
+  // ── Path 2: No MRZ — regex-parse EasyOCR raw text ────────────────────────
   if (!data) {
-    const upperText = text.toUpperCase();
-    const allDates = extractAllDates(text);
+    console.log('[easyocrService] No MRZ — falling back to regex parsing on EasyOCR text');
+    const upperText = rawText.toUpperCase();
+    const allDates = extractAllDates(rawText);
     data = {
       name: extractName(lines, upperText),
       dateOfBirth: allDates[0] || null,
@@ -79,67 +75,34 @@ async function scanWithTesseract(imageBuffer) {
       idNumber: extractIDNumber(lines, upperText),
       state: extractState(upperText),
     };
+
+    console.log('[easyocrService] Parsed from regex:', JSON.stringify(data, null, 2));
   }
 
-  // Throw to trigger Textract failsafe if result is too poor
   const allNull = Object.values(data).every(v => v === null);
-  if (confidence < 40 || allNull) {
+  if (allNull) {
+    console.warn('[easyocrService] All fields null — throwing to trigger Textract fallback');
     throw new Error(
-      `Tesseract quality too low (confidence: ${confidence.toFixed(1)}, all fields null: ${allNull})`
+      `EasyOCR quality too low (confidence: ${confidence.toFixed(1)}, all fields null)`
     );
   }
 
   return { data, rawText };
 }
 
-// ── MRZ helpers ─────────────────────────────────────────────────────────────
-
-function buildMrzName(fields) {
-  const last = (fields.lastName || '').replace(/</g, ' ').trim();
-  const first = (fields.firstName || '').replace(/</g, ' ').trim();
-  return [first, last].filter(Boolean).join(' ') || null;
-}
+// ── MRZ date conversion (YYMMDD → MM/DD/YYYY) ────────────────────────────────
 
 function convertMrzDate(yymmdd) {
-  if (!yymmdd || !/^\d{6}$/.test(yymmdd)) return null;
-  const year = parseInt(yymmdd.substring(0, 2), 10);
+  if (!yymmdd || !/^\d{6}$/.test(String(yymmdd))) return null;
+  const s = String(yymmdd);
+  const year = parseInt(s.substring(0, 2), 10);
   const fullYear = year > 30 ? 1900 + year : 2000 + year;
-  const month = yymmdd.substring(2, 4);
-  const day = yymmdd.substring(4, 6);
+  const month = s.substring(2, 4);
+  const day = s.substring(4, 6);
   return `${month}/${day}/${fullYear}`;
 }
 
-function parseManualMRZ(mrzLines) {
-  const line1 = mrzLines[0].replace(/\s/g, '');
-  const line2 = mrzLines[1].replace(/\s/g, '');
-
-  const namePart = line1.substring(5).split('<<');
-  const lastName = (namePart[0] || '').replace(/</g, ' ').trim();
-  const firstName = (namePart[1] || '').replace(/</g, ' ').trim();
-  const fullName = [firstName, lastName].filter(Boolean).join(' ') || null;
-
-  let dob = null;
-  if (line2.length >= 6) {
-    const dobRaw = line2.substring(0, 6);
-    if (/^\d{6}$/.test(dobRaw)) {
-      const year = parseInt(dobRaw.substring(0, 2), 10);
-      const fullYear = year > 30 ? 1900 + year : 2000 + year;
-      const month = dobRaw.substring(2, 4);
-      const day = dobRaw.substring(4, 6);
-      dob = `${month}/${day}/${fullYear}`;
-    }
-  }
-
-  return {
-    name: fullName,
-    dateOfBirth: dob,
-    address: null,
-    idNumber: line2.substring(0, 9).replace(/</g, '') || null,
-    state: null,
-  };
-}
-
-// ── Regex parsers (ported from app/utils/idParser.ts) ───────────────────────
+// ── Regex parsers (used when no MRZ is present) ───────────────────────────────
 
 function extractAllDates(text) {
   const dates = [];
@@ -261,4 +224,4 @@ function extractState(text) {
   return null;
 }
 
-module.exports = { initWorker, scanWithTesseract };
+module.exports = { scanWithEasyOCR, isHealthy };
