@@ -2,12 +2,13 @@ FROM python:3.11-slim
 
 # System deps:
 #   tesseract-ocr + eng data  → PassportEye
-#   libgl1 + libglib2.0-0     → OpenCV (used internally by EasyOCR)
+#   libgl1 + libglib2.0-0     → OpenCV
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
     tesseract-ocr-eng \
     libgl1 \
     libglib2.0-0 \
+    libzbar0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -15,9 +16,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download EasyOCR English model so it's baked into the image.
-# This avoids a 100 MB download on every cold start.
-RUN python -c "import easyocr; easyocr.Reader(['en'], gpu=False)"
+# Pre-download docTR models (detection + recognition) so they are baked
+# into the image and never downloaded at runtime.
+RUN python -c "from doctr.models import ocr_predictor; ocr_predictor(det_arch='db_resnet50', reco_arch='parseq', pretrained=True)"
 
 COPY app.py .
 

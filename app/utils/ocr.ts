@@ -8,17 +8,22 @@ const API_URL = __DEV__
   : 'https://id-scanner-prototype.onrender.com';
 
 /**
- * Send image to backend for ID extraction via AWS Textract
+ * Send image to backend for ID extraction.
+ * @param imageUri  Local image URI
+ * @param side      Optional hint: 'front' | 'back' — skips irrelevant processing on each side
  */
-export async function scanID(imageUri: string): Promise<ParsedID> {
+export async function scanID(imageUri: string, side?: 'front' | 'back'): Promise<ParsedID> {
   const base64Image = await imageToBase64(imageUri);
+
+  const body: Record<string, string> = { image: base64Image };
+  if (side) body.side = side;
 
   const response = await fetch(`${API_URL}/api/scan`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ image: base64Image }),
+    body: JSON.stringify(body),
   });
 
   if (!response.ok) {
@@ -29,12 +34,16 @@ export async function scanID(imageUri: string): Promise<ParsedID> {
   const result = await response.json();
 
   return {
-    name: result.data.name,
-    dateOfBirth: result.data.dateOfBirth,
-    address: result.data.address,
-    idNumber: result.data.idNumber,
-    state: result.data.state,
-    rawText: result.rawText,
+    name:         result.data.name         ?? null,
+    dateOfBirth:  result.data.dateOfBirth  ?? null,
+    address:      result.data.address      ?? null,
+    idNumber:     result.data.idNumber     ?? null,
+    state:        result.data.state        ?? null,
+    expiryDate:   result.data.expiryDate   ?? null,
+    issueDate:    result.data.issueDate    ?? null,
+    sex:          result.data.sex          ?? null,
+    documentType: result.data.documentType ?? null,
+    rawText:      result.rawText           ?? '',
   };
 }
 

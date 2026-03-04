@@ -7,6 +7,10 @@ export interface ParsedID {
   address: string | null;
   idNumber: string | null;
   state: string | null;
+  expiryDate: string | null;
+  issueDate: string | null;
+  sex: string | null;
+  documentType: 'dl' | 'state_id' | 'passport' | 'id_card' | 'travel_document' | 'unknown' | null;
   rawText: string;
 }
 
@@ -47,6 +51,10 @@ export function parseIDText(ocrText: string): ParsedID {
     address: address,
     idNumber: idNumber,
     state: state,
+    expiryDate: null,
+    issueDate: null,
+    sex: null,
+    documentType: null,
     rawText: ocrText,
   };
 
@@ -88,6 +96,10 @@ function parseMRZ(lines: string[]): Omit<ParsedID, 'rawText'> | null {
       address: null,
       idNumber: line2.substring(0, 9).replace(/</g, '') || null,
       state: null,
+      expiryDate: null,
+      issueDate: null,
+      sex: null,
+      documentType: 'passport',
     };
   }
 

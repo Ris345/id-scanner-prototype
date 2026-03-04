@@ -1,5 +1,7 @@
-easyocr
+python-doctr[torch]
+opencv-python-headless
 flask
 pillow
 numpy
 passporteye
+pyzbar
