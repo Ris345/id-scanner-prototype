@@ -13,37 +13,59 @@ const API_URL = __DEV__
  * @param side      Optional hint: 'front' | 'back' — skips irrelevant processing on each side
  */
 export async function scanID(imageUri: string, side?: 'front' | 'back'): Promise<ParsedID> {
+  console.log('[scanID] Starting — URI:', imageUri.slice(0, 60), '| side:', side ?? 'none');
+
   const base64Image = await imageToBase64(imageUri);
+  console.log('[scanID] Base64 ready — length:', base64Image.length, '| posting to:', `${API_URL}/api/scan`);
 
   const body: Record<string, string> = { image: base64Image };
   if (side) body.side = side;
 
-  const response = await fetch(`${API_URL}/api/scan`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${API_URL}/api/scan`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  } catch (networkErr) {
+    console.error('[scanID] Network error (fetch threw):', networkErr);
+    throw networkErr;
+  }
+
+  console.log('[scanID] Response status:', response.status, response.statusText);
 
   if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.message || 'Failed to scan ID');
+    const errorBody = await response.text();
+    console.error('[scanID] Non-2xx response body:', errorBody);
+    let parsed: any = {};
+    try { parsed = JSON.parse(errorBody); } catch {}
+    throw new Error(parsed.message || parsed.error || `HTTP ${response.status}`);
   }
 
   const result = await response.json();
+  console.log('[scanID] --- SUMMARY ---');
+  console.log('[scanID] success:', result.success);
+  console.log('[scanID] has data key:', 'data' in result);
+  console.log('[scanID] documentType:', result.documentType);
+  console.log('[scanID] rawText length:', (result.rawText ?? '').length);
+  console.log('[scanID] rawText preview:', (result.rawText ?? '').slice(0, 300));
+  console.log('[scanID] fields:', JSON.stringify(result.data));
+  if (!result.success) {
+    throw new Error(result.error || 'OCR service returned success=false');
+  }
 
   return {
-    name:         result.data.name         ?? null,
-    dateOfBirth:  result.data.dateOfBirth  ?? null,
-    address:      result.data.address      ?? null,
-    idNumber:     result.data.idNumber     ?? null,
-    state:        result.data.state        ?? null,
-    expiryDate:   result.data.expiryDate   ?? null,
-    issueDate:    result.data.issueDate    ?? null,
-    sex:          result.data.sex          ?? null,
-    documentType: result.data.documentType ?? null,
-    rawText:      result.rawText           ?? '',
+    name:         result.data?.name         ?? null,
+    dateOfBirth:  result.data?.dateOfBirth  ?? null,
+    address:      result.data?.address      ?? null,
+    idNumber:     result.data?.idNumber     ?? null,
+    state:        result.data?.state        ?? null,
+    expiryDate:   result.data?.expiryDate   ?? null,
+    issueDate:    result.data?.issueDate    ?? null,
+    sex:          result.data?.sex          ?? null,
+    documentType: result.data?.documentType ?? null,
+    rawText:      result.rawText            ?? '',
   };
 }
 

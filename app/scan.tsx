@@ -40,7 +40,11 @@ export default function Scan() {
     try {
       const parsed = await scanID(uri);
 
-      if (!parsed.name && !parsed.dateOfBirth && !parsed.idNumber) {
+      const hasAnyField = parsed.name || parsed.dateOfBirth || parsed.idNumber ||
+                          parsed.expiryDate || parsed.address || parsed.sex;
+      const hasRawText  = (parsed.rawText || '').trim().length > 20;
+      console.log('[processImage] hasAnyField:', !!hasAnyField, '| hasRawText:', hasRawText);
+      if (!hasAnyField && !hasRawText) {
         setState('error');
         setErrorMsg('No text detected. Please try again with a clearer image.');
         return;
@@ -53,8 +57,9 @@ export default function Scan() {
       setTimeout(() => {
         router.replace('/form' as Href);
       }, 1200);
-    } catch (err) {
-      console.error(err);
+    } catch (err: any) {
+      console.error('[processImage] Caught error:', err?.message ?? err);
+      console.error('[processImage] Stack:', err?.stack);
       setState('error');
       setErrorMsg('Failed to process image. Please try again.');
     }
