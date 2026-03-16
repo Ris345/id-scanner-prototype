@@ -5,3 +5,7 @@ pillow
 numpy
 passporteye
 pyzbar
+scikit-image
+paddlepaddle
+paddleocr
+requests

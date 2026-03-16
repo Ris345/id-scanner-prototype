@@ -111,15 +111,6 @@ async function scanWithTextract(imageBuffer) {
   };
 }
 
-// ── MRZ date (YYMMDD → MM/DD/YYYY) ────────────────────────────────────────────
-function convertMrzDate(yymmdd) {
-  if (!yymmdd || !/^\d{6}$/.test(String(yymmdd))) return null;
-  const s = String(yymmdd);
-  const year = parseInt(s.substring(0, 2), 10);
-  const fullYear = year > 30 ? 1900 + year : 2000 + year;
-  return `${s.substring(2, 4)}/${s.substring(4, 6)}/${fullYear}`;
-}
-
 // ── Python microservice ────────────────────────────────────────────────────────
 async function scanWithPython(imageBuffer, side) {
   const body = { image: imageBuffer.toString('base64') };
@@ -146,37 +137,54 @@ async function scanWithPython(imageBuffer, side) {
   console.log(`[Python] raw text:\n${rawText}`);
 
   const f = ocrResult.fields || {};
-  const stateRaw = f.state || null;
+  // Fields are now {value, confidence, source} objects — unwrap .value
+  const fv = key => (f[key] && f[key].value) || null;
+
+  const stateRaw = fv('state');
   const state = (stateRaw && STATE_MAP[stateRaw.toUpperCase()])
     ? STATE_MAP[stateRaw.toUpperCase()]
     : stateRaw;
 
   const data = {
-    name:         f.name         || null,
-    dateOfBirth:  f.dateOfBirth  || null,
-    address:      f.address      || null,
-    idNumber:     f.idNumber     || null,
-    expiryDate:   f.expiryDate   || null,
-    issueDate:    f.issueDate    || null,
-    sex:          f.sex          || null,
+    name:         fv('name'),
+    dateOfBirth:  fv('dateOfBirth'),
+    address:      fv('address'),
+    idNumber:     fv('idNumber'),
+    expiryDate:   fv('expiryDate'),
+    issueDate:    fv('issueDate'),
+    sex:          fv('sex'),
     state,
     documentType: ocrResult.documentType || null,
   };
 
+  const source = ocrResult.source || 'doctr+passporteye+barcode';
   console.log('[Python] parsed fields:', JSON.stringify(data, null, 2));
-  return { data, rawText };
+  return { data, rawText, source };
 }
 
-// ── Merge two data objects — base wins, supplement fills null gaps ─────────────
-function mergeData(base, supplement) {
-  const merged = { ...base };
-  for (const key of Object.keys(supplement)) {
-    if (!merged[key] && supplement[key]) {
-      merged[key] = supplement[key];
-      console.log(`[Merge] '${key}' filled by Textract: ${supplement[key]}`);
-    }
-  }
-  return merged;
+// ── Logging ───────────────────────────────────────────────────────────────────
+function logScanResult(data, source, confidence) {
+  const SEP  = '─'.repeat(58);
+  const SEP2 = '═'.repeat(58);
+  const row  = (label, val) =>
+    `[Node]   ${label.padEnd(14)} ${val ?? '  <-- MISSING'}`;
+
+  console.log(`\n[Node] ${SEP2}`);
+  console.log(`[Node]  SCAN RESULT  (this is the Node server — Python is [PY])`);
+  console.log(`[Node] ${SEP2}`);
+  console.log(`[Node]  source     : ${source}`);
+  console.log(`[Node]  confidence : ${typeof confidence === 'number' ? confidence.toFixed(1) + '%' : confidence ?? '—'}`);
+  console.log(`[Node] ${SEP}`);
+  console.log(row('name',         data.name));
+  console.log(row('dateOfBirth',  data.dateOfBirth));
+  console.log(row('address',      data.address));
+  console.log(row('idNumber',     data.idNumber));
+  console.log(row('expiryDate',   data.expiryDate));
+  console.log(row('issueDate',    data.issueDate));
+  console.log(row('sex',          data.sex));
+  console.log(row('state',        data.state));
+  console.log(row('documentType', data.documentType));
+  console.log(`[Node] ${SEP2}\n`);
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -207,24 +215,49 @@ app.post('/api/scan', upload.single('image'), async (req, res) => {
       return res.status(400).json({ error: 'No image provided' });
     }
 
-    const side = req.body.side || null;
-    console.log('\nReceived image:', (imageBuffer.length / 1024).toFixed(1), 'KB', side ? `| side=${side}` : '');
+    const side     = req.body.side     || null;
+    const platform = req.body.platform === 'desktop' ? 'desktop' : 'mobile';
+    console.log('\nReceived image:', (imageBuffer.length / 1024).toFixed(1), 'KB',
+      side ? `| side=${side}` : '', `| platform=${platform}`);
 
-    // ── Step 1: Python (docTR + barcode + MRZ) — always primary ──────────────
-    try {
-      const result = await scanWithPython(imageBuffer, side);
-      return res.json({ success: true, ...result, source: 'doctr+passporteye+barcode' });
-    } catch (e) {
-      console.warn('[server] Python service failed:', e.message);
-    }
-
-    // ── Step 2: Textract — only if Python service itself crashed ──────────────
-    if (textractAvailable() && textractClient) {
+    if (platform === 'mobile') {
+      // ── Mobile: full Python pipeline (docTR + MRZ + PDF417 barcode) ──────────
+      // Textract is a last resort only if the Python service itself crashes.
       try {
-        const result = await scanWithTextract(imageBuffer);
-        return res.json({ success: true, ...result, source: 'textract' });
+        const result = await scanWithPython(imageBuffer, side);
+        logScanResult(result.data, result.source, result.data?.confidence ?? null);
+        return res.json({ success: true, ...result });
       } catch (e) {
-        console.error('[server] Textract also failed:', e.message);
+        console.warn('[server][mobile] Python service failed:', e.message);
+      }
+
+      if (textractAvailable() && textractClient) {
+        try {
+          const result = await scanWithTextract(imageBuffer);
+          logScanResult(result.data, 'textract', null);
+          return res.json({ success: true, ...result, source: 'textract' });
+        } catch (e) {
+          console.error('[server][mobile] Textract also failed:', e.message);
+        }
+      }
+    } else {
+      // ── Desktop: Python primary, Textract only if Python crashes ─────────────
+      try {
+        const result = await scanWithPython(imageBuffer, side);
+        logScanResult(result.data, result.source, result.data?.confidence ?? null);
+        return res.json({ success: true, ...result });
+      } catch (e) {
+        console.warn('[server][desktop] Python service failed:', e.message);
+      }
+
+      if (textractAvailable() && textractClient) {
+        try {
+          const result = await scanWithTextract(imageBuffer);
+          logScanResult(result.data, 'textract', null);
+          return res.json({ success: true, ...result, source: 'textract' });
+        } catch (e) {
+          console.error('[server][desktop] Textract also failed:', e.message);
+        }
       }
     }
 

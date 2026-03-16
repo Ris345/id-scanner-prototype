@@ -18,7 +18,8 @@ export async function scanID(imageUri: string, side?: 'front' | 'back'): Promise
   const base64Image = await imageToBase64(imageUri);
   console.log('[scanID] Base64 ready — length:', base64Image.length, '| posting to:', `${API_URL}/api/scan`);
 
-  const body: Record<string, string> = { image: base64Image };
+  const platform = Platform.OS === 'web' ? 'desktop' : 'mobile';
+  const body: Record<string, string> = { image: base64Image, platform };
   if (side) body.side = side;
 
   let response: Response;
