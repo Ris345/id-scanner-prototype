@@ -120,7 +120,7 @@ async function scanWithPython(imageBuffer, side) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(30000),
+    signal: AbortSignal.timeout(120000),
   });
 
   if (!res.ok) {
@@ -159,7 +159,7 @@ async function scanWithPython(imageBuffer, side) {
 
   const source = ocrResult.source || 'doctr+passporteye+barcode';
   console.log('[Python] parsed fields:', JSON.stringify(data, null, 2));
-  return { data, rawText, source };
+  return { data, rawText, source, confidence };
 }
 
 // ── Logging ───────────────────────────────────────────────────────────────────
@@ -215,48 +215,27 @@ app.post('/api/scan', upload.single('image'), async (req, res) => {
       return res.status(400).json({ error: 'No image provided' });
     }
 
-    const side     = req.body.side     || null;
-    const platform = req.body.platform === 'desktop' ? 'desktop' : 'mobile';
+    const side = req.body.side || null;
     console.log('\nReceived image:', (imageBuffer.length / 1024).toFixed(1), 'KB',
-      side ? `| side=${side}` : '', `| platform=${platform}`);
+      side ? `| side=${side}` : '');
 
-    if (platform === 'mobile') {
-      // ── Mobile: full Python pipeline (docTR + MRZ + PDF417 barcode) ──────────
-      // Textract is a last resort only if the Python service itself crashes.
-      try {
-        const result = await scanWithPython(imageBuffer, side);
-        logScanResult(result.data, result.source, result.data?.confidence ?? null);
-        return res.json({ success: true, ...result });
-      } catch (e) {
-        console.warn('[server][mobile] Python service failed:', e.message);
-      }
+    // ── Primary: Python OCR pipeline ──────────────────────────────────────────
+    try {
+      const result = await scanWithPython(imageBuffer, side);
+      logScanResult(result.data, result.source, result.confidence ?? null);
+      return res.json({ success: true, ...result });
+    } catch (pythonErr) {
+      console.warn('[Node] Python service failed:', pythonErr.message);
 
+      // ── Fallback: Textract — only if Python crashed AND creds are set ─────────
       if (textractAvailable() && textractClient) {
+        console.warn('[Node] TEXTRACT FALLBACK — image sent to AWS');
         try {
           const result = await scanWithTextract(imageBuffer);
           logScanResult(result.data, 'textract', null);
           return res.json({ success: true, ...result, source: 'textract' });
-        } catch (e) {
-          console.error('[server][mobile] Textract also failed:', e.message);
-        }
-      }
-    } else {
-      // ── Desktop: Python primary, Textract only if Python crashes ─────────────
-      try {
-        const result = await scanWithPython(imageBuffer, side);
-        logScanResult(result.data, result.source, result.data?.confidence ?? null);
-        return res.json({ success: true, ...result });
-      } catch (e) {
-        console.warn('[server][desktop] Python service failed:', e.message);
-      }
-
-      if (textractAvailable() && textractClient) {
-        try {
-          const result = await scanWithTextract(imageBuffer);
-          logScanResult(result.data, 'textract', null);
-          return res.json({ success: true, ...result, source: 'textract' });
-        } catch (e) {
-          console.error('[server][desktop] Textract also failed:', e.message);
+        } catch (textractErr) {
+          console.error('[Node] Textract also failed:', textractErr.message);
         }
       }
     }

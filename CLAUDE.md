@@ -19,8 +19,11 @@ cd backend && npm run dev
 cd backend/python-easy-ocr && docker-compose up -d
 docker-compose logs -f  # tail logs
 
-# Full rebuild (needed when app.py or Dockerfile changes)
-cd backend/python-easy-ocr && docker-compose down && docker-compose build --no-cache && docker-compose up -d && docker-compose logs -f
+# Copy app.py change into running container (no rebuild needed for Python-only changes)
+docker cp app.py python-ocr-1:/app/app.py && docker restart python-ocr-1
+
+# Full rebuild (needed when requirements.txt or Dockerfile changes)
+cd backend/python-easy-ocr && docker-compose down --rmi all && docker-compose build --no-cache && docker-compose up -d && docker-compose logs -f
 
 # Ollama (run in separate terminal before scanning)
 ollama serve  # if not already running — check with: lsof -i :11434
@@ -31,31 +34,39 @@ npx expo start
 
 ## OCR Pipeline
 
-**Priority order**: barcode > MRZ > docTR spatial > regex > Ollama > PaddleOCR > Textract (last resort)
+**Priority order**: barcode > MRZ > llama3.2-vision > Textract (crash fallback only)
+
+```
+Image
+  ↓
+1. PDF417 barcode decode       → if found + parsed → return (confidence 1.0)
+  ↓
+2. MRZ (PassportEye)           → if found + checksum passes → return (confidence 0.98)
+  ↓
+3. llama3.2-vision:11b (Ollama) → sends image directly, returns structured JSON fields
+```
 
 - `POST /api/scan` → Python microservice always first
-- **Regex**: gap-fills any field spatial extraction missed
-- **Ollama** (`gemma3:4b`): triggered when name/dateOfBirth/idNumber still null after regex — sends raw OCR text with structured prompt, returns JSON
-- **PaddleOCR**: triggered when docTR confidence < 0.75 for name/dateOfBirth/idNumber
-- **Textract**: only fires if Python service crashes entirely
-- Response `source` tag: `"doctr"` | `"doctr+ollama"` | `"doctr+paddle"` | `"doctr+passporteye+barcode"` | `"textract"`
-- Optional `side: 'front' | 'back'` in request body skips irrelevant processing
+- **Ollama receives the image** — vision model reads the ID card directly, no OCR pre-step
+- **Textract**: only fires in Node.js if the Python service throws entirely
+- Optional `side: 'front' | 'back'` in request body skips irrelevant stages
+- Document classifier (aspect ratio) gates which stages run: `dl_or_stateid` | `passport` | `unknown`
+- Node.js timeout: 120s (llama3.2-vision:11b is slow on first load, ~30-60s)
 
 ## Output Schema
 
 Each field is a structured object — NOT a plain string:
 ```json
 {
-  "name":        { "value": "JOHN SMITH", "confidence": 0.92, "source": "doctr" },
+  "name":        { "value": "JOHN SMITH", "confidence": 0.92, "source": "llama-vision" },
   "dateOfBirth": { "value": "01/15/1990", "confidence": 1.0,  "source": "barcode" }
 }
 ```
-`source` values: `"barcode"` | `"mrz"` | `"doctr"` | `"paddle"` | `"regex"` | `"ollama"` | `"textract"`
+`source` values: `"barcode"` | `"mrz"` | `"llama-vision"` | `"textract"`
 
 **server.js unwraps with**: `const fv = key => (f[key] && f[key].value) || null`
-— if this breaks it means Python returned old flat schema (Docker needs rebuild).
 
-Response also includes `warnings.glare_ratio` if > 15% of image is blown out.
+Response also includes `warnings: ["glare_detected"]` if > 15% of image is blown out.
 
 ## Output Fields
 
@@ -65,12 +76,12 @@ Response also includes `warnings.glare_ratio` if > 15% of image is blown out.
 
 | File | Purpose |
 |------|---------|
-| `backend/server.js` | Express API, OCR routing, Textract failsafe, `logScanResult()` |
-| `backend/python-easy-ocr/app.py` | Full OCR pipeline — docTR + Ollama + PaddleOCR + PDF417 + PassportEye + regex |
-| `backend/python-easy-ocr/Dockerfile` | Pre-bakes docTR + PaddleOCR models at build time |
-| `backend/python-easy-ocr/requirements.txt` | Python deps: paddlepaddle, paddleocr, scikit-image, requests |
+| `backend/server.js` | Express API, Python call, Textract crash fallback, `logScanResult()` |
+| `backend/python-easy-ocr/app.py` | OCR pipeline — barcode + MRZ + docTR raw text + Ollama structuring |
+| `backend/python-easy-ocr/Dockerfile` | Pre-bakes docTR models at build time |
+| `backend/python-easy-ocr/requirements.txt` | Python deps |
 | `app/utils/ocr.ts` | `scanID(uri, side?)` — frontend HTTP client |
-| `app/utils/idParser.ts` | `ParsedID` interface + client-side regex fallbacks |
+| `app/utils/idParser.ts` | `ParsedID` interface |
 | `app/scan.tsx` | Camera UI, capture/gallery, pinch-to-zoom |
 | `app/form.tsx` | Verification form with editable fields |
 | `app/context/ScanContext.tsx` | Cross-screen state for scanned data |
@@ -78,103 +89,76 @@ Response also includes `warnings.glare_ratio` if > 15% of image is blown out.
 ## Python Microservice Details
 
 ### Models
-- **docTR**: `db_resnet50` (detection) + `parseq` (recognition)
-- **PaddleOCR**: PP-OCRv5 — `use_textline_orientation=True` (PaddleOCR 3.x API)
-
-### PaddleOCR 3.x API Breaking Changes
-Old params removed — will throw `ValueError: Unknown argument`:
-- `use_gpu` → removed (device auto-detected)
-- `use_angle_cls` → renamed to `use_textline_orientation`
-- `lang` → removed
-- `show_log` → removed
-- `ocr()` call: `cls=True` arg removed — use `paddle_ocr.ocr(img_array)` with no extra args
+- **docTR**: `db_resnet50` (detection) + `parseq` (recognition) — used for raw text extraction only
+- PaddleOCR removed entirely
 
 ### GPU detection
-Auto-detects CUDA → Apple MPS → CPU at startup. PaddleOCR has no MPS backend — falls back to CPU on Apple Silicon automatically.
+Auto-detects CUDA → Apple MPS → CPU at startup.
 
-### Preprocessing — docTR
-Upscale to 1200px min + CLAHE on LAB luminance channel (handles glare/contrast).
-
-### Preprocessing — PaddleOCR
-1. **Perspective correction** — `cv2.getPerspectiveTransform` + `warpPerspective` on detected card corners
-2. **Specular glare masking** — threshold at 240, `cv2.inpaint` INPAINT_TELEA radius=7
-3. No binarization — PP-OCRv5 is neural, binarization hurts accuracy
-
-### Spatial extraction
-Label-proximity bounding-box search in normalized [0,1] coords. Returns per-field confidence (avg of value word confidences). Logs `[PY][Name]` diagnostics for all name-related fields.
-
-### Regex fallback — NY / no-label ID format
-`_extract_fields_regex_flat()` handles two layouts:
-- **Standard**: label on same line or next line (FN, LN, DOB etc.)
-- **NY-style** (no labels): consecutive ALL-CAPS single-word lines → LASTNAME then FIRSTNAME[,MIDDLENAME]
-- **Space-split ID numbers**: joins digit-only tokens per line (e.g. `0210 049 849` → `0210049849`)
-- Name separator: splits on `,` `.` or space — handles both `RISHAV,DEV` and `RISHAV.DEV`
-
-### Ollama gap-filler
-- Model: `gemma3:4b` (local, via `ollama serve`)
-- URL: `host.docker.internal:11434` inside Docker, `localhost:11434` outside
-- Prompt instructs model to classify dates by year, handle consecutive name lines, join split ID numbers
-- Returns fields with `confidence: 0.7, source: "ollama"`
-- Silently falls through if Ollama not running (`ConnectionError` caught)
+### Preprocessing
+Upscale to 1200px min + CLAHE on LAB luminance channel. Applied before docTR.
+Numpy array converted to PNG bytes before passing to `DocumentFile.from_images()`.
 
 ### Barcode
-PDF417 via pyzbar, 3-strategy decode (full → bottom-half crop → 2x upscale), AAMVA field mapping.
+PDF417 via pyzbar, 3-strategy decode (full image → bottom-half crop → 2x upscale), AAMVA field mapping.
 
 ### MRZ
-PassportEye (requires system Tesseract).
+PassportEye (requires system Tesseract). Confidence 0.98 if checksum passes, 0.50 if not.
+
+### Ollama vision
+- Model: `llama3.2-vision:11b` (local, via `ollama serve`)
+- URL: `host.docker.internal:11434` inside Docker, `localhost:11434` outside
+- **Receives the raw image** — vision model reads the ID card directly
+- Prompt instructs model to return structured JSON with all ID fields
+- Returns fields with `confidence: 0.70, source: "llama-vision"`
+- Silently falls through if Ollama not running
+- Pre-warm before first scan: `ollama run llama3.2-vision:11b "hi"`
+- Run Ollama with Metal GPU: `OLLAMA_HOST=0.0.0.0 ollama serve`
 
 ### Environment flags
-- `PADDLE_ENABLED=false` — disables PaddleOCR (graceful degrade)
-- `OLLAMA_ENABLED=false` — disables Ollama gap-filler
-- `OLLAMA_MODEL=gemma3:4b` — Ollama model (default: gemma3:4b)
+- `OLLAMA_ENABLED=false` — disables Ollama structuring
+- `OLLAMA_MODEL=gemma3:4b` — Ollama model
 - `OLLAMA_HOST=host.docker.internal` — use `localhost` outside Docker
-- `PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True` — skips Paddle connectivity check at startup
 
 ## Logging
 
 All Python logs prefixed `[PY]` — distinct from `[Node]` in server.js.
 Key prefixes to watch:
-- `[PY] NEW REQUEST` — request banner showing which stages will run
-- `[PY][Name]` — per-field name diagnostics (label found/missed, candidates tried)
-- `[PY][Regex]` — what regex extracted and which path fired
-- `[PY][Ollama]` — whether triggered, what it returned
-- `[PY] RESULT SUMMARY` — final table with value/confidence/source per field, `<-- MISSING` markers
+- `[PY] NEW REQUEST` — request banner with side and doc_class
+- `[PY][Barcode]` — PDF417 decode result
+- `[PY][MRZ]` — MRZ parse result
+- `[PY][docTR]` — line count + raw text extracted
+- `[PY][Ollama]` — field count returned
+- `[PY] RESULT` — final table with confidence/source per field, `<-- MISSING` markers
 - `[Node] SCAN RESULT` — Node-side view of final merged fields
 
 ## server.js Notes
 
 - `scanWithPython()` unwraps `.value` from structured fields via `fv(key)` helper
-- `source` tag passed through from Python (not hardcoded in Node)
+- `confidence` passed through from Python response
 - `logScanResult()` prints `[Node]` summary after every scan
-- Textract fires only if Python service throws — not on low confidence
-- Dead code removed: `convertMrzDate`, `mergeData`
+- **Textract fires only if Python service throws** — not on low confidence
+- Mobile/desktop platform split removed — single code path for all clients
 
-## Current State / Next Session
+## Current State
 
 ### What's working
-- Full pipeline wired: docTR → regex → Ollama → PaddleOCR → Textract
-- Structured output schema `{value, confidence, source}` on all fields
-- NY-style no-label ID parsing (consecutive caps lines, space-split IDs)
-- Ollama integration with `gemma3:4b` — graceful fallback if not running
-- Logging fully labelled `[PY]` vs `[Node]`
+- Pipeline: barcode → MRZ → llama3.2-vision:11b
+- PaddleOCR, docTR spatial extraction, regex fallback all removed
+- llama3.2-vision reads image directly — no OCR pre-step needed
+- PII stays local — no external APIs
+- Docker container clean, server.js Textract logic correctly nested in Python catch block
+- Node.js timeout bumped to 120s for vision model load time
 
-### Blocker as of last session
-Docker build failing on PaddleOCR pre-bake step. Last fix applied:
-```dockerfile
-RUN PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True python -c \
-    "from paddleocr import PaddleOCR; PaddleOCR(use_textline_orientation=True)"
-```
-**Next step**: confirm Docker build completes, check `[PY]` logs appear on scan, verify NY permit fields extract correctly (name, DOB, dates, ID number).
-
-### After Docker is stable
-- Verify Ollama fills fields that regex misses on NY permit
-- Test with more ID types when available
-- Consider sanitizing name output (e.g. `RISHAV ACHARYA` → proper casing for form)
-- Frontend form field mapping — `app/form.tsx` needs to consume new structured schema
+### Next steps
+- Tune llama3.2-vision prompt — check raw model response in Docker logs first
+- Test across ID types: NY permit, standard DL front, passport
+- On-device barcode decode (React Native Vision Camera) — eliminates server round-trip for ~70% of DL scans
+- Frontend form field mapping — `app/form.tsx` consuming structured schema
 
 ## Environment
 
-AWS credentials in `backend/.env` are optional — Textract is fallback only.
+AWS credentials in `backend/.env` are optional — Textract is crash fallback only.
 
 ```
 AWS_ACCESS_KEY_ID=...
@@ -186,7 +170,6 @@ AWS_REGION=us-east-1
 
 ```bash
 brew install tesseract zbar
-pip install paddlepaddle paddleocr scikit-image requests  # local run without Docker
 ollama pull gemma3:4b  # pull model once
 ```
 
@@ -194,7 +177,5 @@ ollama pull gemma3:4b  # pull model once
 
 Models pre-baked at build time — no downloads at runtime:
 - docTR: `db_resnet50` + `parseq`
-- PaddleOCR: PP-OCRv5 (CPU, `use_textline_orientation=True`)
 
-System deps: `tesseract-ocr`, `libgl1`, `libglib2.0-0`, `libzbar0`, `libgomp1` (PaddlePaddle OpenMP).
-Build flag: `PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True` skips connectivity check.
+System deps: `tesseract-ocr`, `libgl1`, `libglib2.0-0`, `libzbar0`.

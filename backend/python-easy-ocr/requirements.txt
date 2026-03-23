@@ -6,6 +6,5 @@ numpy
 passporteye
 pyzbar
 scikit-image
-paddlepaddle
-paddleocr
+pytesseract
 requests
