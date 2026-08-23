@@ -1,3 +1,7 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # ID Scanner Prototype
 
 Government ID document scanning app that extracts structured data from photos of driver's licenses, passports, and national IDs.
@@ -5,39 +9,76 @@ Government ID document scanning app that extracts structured data from photos of
 ## Architecture
 
 Three-tier system:
-- **Frontend**: Expo (React Native) — `app/`
-- **Backend**: Node.js/Express on port 3001 — `backend/server.js`
-- **Python OCR microservice**: Flask on port 3002 — `backend/python-easy-ocr/app.py`
+- **Frontend**: Expo (React Native) — `app/` — runs on the host
+- **Backend**: Node.js/Express on port 3001 — `backend/server.js` — Docker
+- **Python OCR microservice**: Flask on port 3002 — `backend/python-easy-ocr/app.py` — Docker
+
+Inside the compose network the Node service reaches Python at `http://python-ocr:3002`
+(`PYTHON_OCR_URL`), not `localhost` — localhost in a container is the container itself.
+Both ports are still published, so host tools and the Expo app keep using `localhost`.
 
 ## Dev Commands
 
+Both backend services run in Docker. `docker-compose.yml` lives in `backend/`, not
+`backend/python-easy-ocr/`.
+
 ```bash
-# Backend (Node — nodemon auto-restarts on save)
-cd backend && npm run dev
+# Whole backend stack (Node :3001 + Python :3002). Node waits for Python's healthcheck.
+cd backend && docker-compose up -d
+docker-compose logs -f            # tail both
+docker-compose logs -f python-ocr # tail just the [PY] pipeline
 
-# Python microservice (Docker — always use this)
-cd backend/python-easy-ocr && docker-compose up -d
-docker-compose logs -f  # tail logs
+# Ollama — runs on the HOST, not in Docker (see below). Separate terminal, before scanning.
+OLLAMA_HOST=0.0.0.0 ollama serve  # Metal GPU on Mac; check port: lsof -i :11434
 
-# Copy app.py change into running container (no rebuild needed for Python-only changes)
-docker cp app.py python-ocr-1:/app/app.py && docker restart python-ocr-1
-
-# Full rebuild (needed when requirements.txt or Dockerfile changes)
-cd backend/python-easy-ocr && docker-compose down --rmi all && docker-compose build --no-cache && docker-compose up -d && docker-compose logs -f
-
-# Ollama (run in separate terminal before scanning)
-ollama serve  # if not already running — check with: lsof -i :11434
-
-# Frontend
+# Frontend (host)
 npx expo start
 ```
+
+Containers are `id-scanner-backend-1` and `id-scanner-python-ocr-1`.
+
+### Applying changes
+
+```bash
+# server.js is bind-mounted read-only — just restart, no rebuild
+cd backend && docker-compose restart backend
+
+# app.py is baked into the image; copy it in for a fast iteration
+docker cp python-easy-ocr/app.py id-scanner-python-ocr-1:/app/app.py && docker restart id-scanner-python-ocr-1
+
+# Rebuild (needed when requirements.txt, package.json, or a Dockerfile changes)
+docker-compose build && docker-compose up -d --force-recreate
+```
+
+### Why Ollama is not in the compose stack
+
+A container cannot reach Apple's Metal GPU, so an 11B vision model inside Docker runs on
+CPU — minutes per scan instead of ~30–60s. `python-ocr` therefore talks to the host's
+Ollama via `host.docker.internal` (the `extra_hosts: host-gateway` line makes that work on
+Linux too). To containerise it anyway — sensible on a Linux/CUDA box, or for full isolation:
+
+```bash
+docker-compose --profile ollama up -d
+OLLAMA_HOST=ollama docker-compose up -d python-ocr   # point the service at it
+docker exec id-scanner-ollama-1 ollama pull llama3.2-vision:11b
+```
+
+### Compose project name
+
+`name: id-scanner` is pinned at the top of `docker-compose.yml`. Without it Compose derives
+the project name from the directory (`backend`) and will **adopt and recreate identically
+named services from any other project on the machine that also has a `backend/` dir**.
+Do not remove it, and never run `docker-compose down --remove-orphans` from this directory.
 
 ## OCR Pipeline
 
 **Priority order**: barcode > MRZ > llama3.2-vision > Textract (crash fallback only)
 
 ```
-Image
+Image (full camera frame)
+  ↓
+0. detect_card()               → locate card outline, perspective-correct, crop
+   preprocess()                → upscale to 1200px + CLAHE
   ↓
 1. PDF417 barcode decode       → if found + parsed → return (confidence 1.0)
   ↓
@@ -47,22 +88,45 @@ Image
 ```
 
 - `POST /api/scan` → Python microservice always first
-- **Ollama receives the image** — vision model reads the ID card directly, no OCR pre-step
+- **Ollama receives the raw image bytes** — vision model reads the ID card directly, no OCR pre-step
 - **Textract**: only fires in Node.js if the Python service throws entirely
 - Optional `side: 'front' | 'back'` in request body skips irrelevant stages
 - Document classifier (aspect ratio) gates which stages run: `dl_or_stateid` | `passport` | `unknown`
-- Node.js timeout: 120s (llama3.2-vision:11b is slow on first load, ~30-60s)
+- **The classifier only runs on a successful card crop.** On a full portrait frame it is meaningless — it classifies as `passport` and would skip the barcode stage on a driver's license. When `detect_card()` finds nothing, doc_class is forced to `unknown` so every stage still runs.
+- Node.js timeout: 120s (llama3.2-vision:11b is slow on first load, ~30–60s)
+
+### Unused code in pipeline
+
+- `ocr_model` (docTR `db_resnet50` + `parseq`) is loaded at startup but **not called** in the `/ocr` route — it's a leftover from a prior pipeline; the Dockerfile pre-bakes it to avoid first-run downloads if it gets re-wired
+- `try_tesseract()` in `app.py` exists but is **not called** from `/ocr` — it's a dormant stage between MRZ and Ollama
+- `parseIDText()` in `app/utils/idParser.ts` is legacy regex parsing — **not called** from `scan.tsx` or `ocr.ts`; the file's live purpose is the `ParsedID` interface
+
+### Client-side cropping
+
+`cropToGuideFrame()` in `scan.tsx` maps the on-screen guide frame onto the captured photo
+and crops to it (+12% padding, so a loosely framed card isn't clipped — the PDF417 sits at
+the card edge). Both the container and the guide `View` are measured with `measureInWindow`;
+the preview fills the view "cover"-style, so the mapping divides out that scale and centring.
+
+It returns the **uncropped** URI whenever the geometry can't be trusted — unmeasured views,
+a landscape photo buffer behind a portrait preview, or a degenerate rect. A wrong crop is
+worse than none, since `detect_card()` can still find the card server-side.
+
+Camera captures only. **Gallery picks are never cropped** — there's no guide frame to map.
 
 ## Output Schema
 
 Each field is a structured object — NOT a plain string:
 ```json
 {
-  "name":        { "value": "JOHN SMITH", "confidence": 0.92, "source": "llama-vision" },
+  "name":        { "value": "JOHN SMITH", "confidence": 0.92, "source": "ollama" },
   "dateOfBirth": { "value": "01/15/1990", "confidence": 1.0,  "source": "barcode" }
 }
 ```
-`source` values: `"barcode"` | `"mrz"` | `"llama-vision"` | `"textract"`
+
+Per-field `source` values: `"barcode"` | `"mrz"` | `"ollama"` | (Textract fields are plain strings, no `.source`)
+
+Top-level response `source` field uses: `"barcode"` | `"mrz"` | `"llama-vision"` | `"textract"`
 
 **server.js unwraps with**: `const fv = key => (f[key] && f[key].value) || null`
 
@@ -77,30 +141,55 @@ Response also includes `warnings: ["glare_detected"]` if > 15% of image is blown
 | File | Purpose |
 |------|---------|
 | `backend/server.js` | Express API, Python call, Textract crash fallback, `logScanResult()` |
-| `backend/python-easy-ocr/app.py` | OCR pipeline — barcode + MRZ + docTR raw text + Ollama structuring |
-| `backend/python-easy-ocr/Dockerfile` | Pre-bakes docTR models at build time |
+| `backend/python-easy-ocr/app.py` | OCR pipeline — barcode + MRZ + Ollama vision |
+| `backend/python-easy-ocr/Dockerfile` | Pre-bakes docTR models at build time (model loaded at startup, not used in scan path) |
 | `backend/python-easy-ocr/requirements.txt` | Python deps |
 | `app/utils/ocr.ts` | `scanID(uri, side?)` — frontend HTTP client |
-| `app/utils/idParser.ts` | `ParsedID` interface |
-| `app/scan.tsx` | Camera UI, capture/gallery, pinch-to-zoom |
+| `app/utils/idParser.ts` | `ParsedID` interface (+ legacy `parseIDText` not used in scan flow) |
+| `app/scan.tsx` | Camera UI, capture/gallery, pinch-to-zoom, `cropToGuideFrame()` |
 | `app/form.tsx` | Verification form with editable fields |
 | `app/context/ScanContext.tsx` | Cross-screen state for scanned data |
 
 ## Python Microservice Details
 
 ### Models
-- **docTR**: `db_resnet50` (detection) + `parseq` (recognition) — used for raw text extraction only
-- PaddleOCR removed entirely
+- **docTR**: `db_resnet50` (detection) + `parseq` (recognition) — loaded at startup, not called in scan route
+- **Tesseract**: `try_tesseract()` defined but not wired into the `/ocr` route
 
 ### GPU detection
 Auto-detects CUDA → Apple MPS → CPU at startup.
 
+### Card detection
+`detect_card()` — Canny + contour search for the largest 4-sided shape covering >5% of the
+frame with an aspect between 1.2 and 2.2 (ID-1 is ~1.586), then `getPerspectiveTransform`
+to rectify it. Sideways cards are rotated to landscape. Falls back to the full frame when
+no card outline is found.
+
+This runs on **every** image regardless of client-side cropping — it is what corrects
+perspective skew, and gallery uploads are never cropped by the client.
+
 ### Preprocessing
-Upscale to 1200px min + CLAHE on LAB luminance channel. Applied before docTR.
-Numpy array converted to PNG bytes before passing to `DocumentFile.from_images()`.
+Upscale to 1200px min + CLAHE on LAB luminance channel. Applied to the card crop, before all stages.
+Numpy array converted to PNG bytes via `to_png_bytes()` for the MRZ and Ollama stages.
 
 ### Barcode
-PDF417 via pyzbar, 3-strategy decode (full image → bottom-half crop → 2x upscale), AAMVA field mapping.
+PDF417 via **zxing-cpp**, then pyzbar as a secondary attempt. Each gets the same 3 strategies
+(full image → bottom-half crop → 2x upscale). Tried on the card crop first, then on the
+untouched frame — the warp and CLAHE can both disturb a PDF417.
+
+**Do not rely on pyzbar/ZBar for PDF417.** Its PDF417 decoder is a stub: it recognises the
+symbol but returns no data, even on a clean, high-resolution, machine-generated barcode.
+While it was the only decoder, the barcode stage never produced a single field.
+
+`_zxing_decode()` reads `r.bytes`, **not** `r.text` — zxing renders control characters as a
+literal `"<LF>"` in `.text`, which leaves the AAMVA payload with zero real line breaks and
+sends `_parse_aamva()` down its malformed-input branch.
+
+`_parse_aamva()` parses **one element per line** (AAMVA elements are newline-delimited).
+Do not split on a bare `[A-Z]{3}` lookahead: that truncates every text value at its first
+uppercase run (`SMITH` → `S`, `123 MAIN ST` → `123`) and returns the wreckage at confidence 1.0.
+It scans each line for its first known code rather than assuming offset 0, since the header
+line prefixes it with subfile designators (`ANSI 636001...DLDAQ123456789`).
 
 ### MRZ
 PassportEye (requires system Tesseract). Confidence 0.98 if checksum passes, 0.50 if not.
@@ -108,16 +197,15 @@ PassportEye (requires system Tesseract). Confidence 0.98 if checksum passes, 0.5
 ### Ollama vision
 - Model: `llama3.2-vision:11b` (local, via `ollama serve`)
 - URL: `host.docker.internal:11434` inside Docker, `localhost:11434` outside
-- **Receives the raw image** — vision model reads the ID card directly
+- **Receives the raw image bytes** — vision model reads the ID card directly
 - Prompt instructs model to return structured JSON with all ID fields
-- Returns fields with `confidence: 0.70, source: "llama-vision"`
+- Returns fields with `confidence: 0.70, source: "ollama"`
 - Silently falls through if Ollama not running
 - Pre-warm before first scan: `ollama run llama3.2-vision:11b "hi"`
-- Run Ollama with Metal GPU: `OLLAMA_HOST=0.0.0.0 ollama serve`
 
 ### Environment flags
 - `OLLAMA_ENABLED=false` — disables Ollama structuring
-- `OLLAMA_MODEL=gemma3:4b` — Ollama model
+- `OLLAMA_MODEL=<model>` — override model (default: `llama3.2-vision:11b`)
 - `OLLAMA_HOST=host.docker.internal` — use `localhost` outside Docker
 
 ## Logging
@@ -127,7 +215,6 @@ Key prefixes to watch:
 - `[PY] NEW REQUEST` — request banner with side and doc_class
 - `[PY][Barcode]` — PDF417 decode result
 - `[PY][MRZ]` — MRZ parse result
-- `[PY][docTR]` — line count + raw text extracted
 - `[PY][Ollama]` — field count returned
 - `[PY] RESULT` — final table with confidence/source per field, `<-- MISSING` markers
 - `[Node] SCAN RESULT` — Node-side view of final merged fields
@@ -138,23 +225,7 @@ Key prefixes to watch:
 - `confidence` passed through from Python response
 - `logScanResult()` prints `[Node]` summary after every scan
 - **Textract fires only if Python service throws** — not on low confidence
-- Mobile/desktop platform split removed — single code path for all clients
-
-## Current State
-
-### What's working
-- Pipeline: barcode → MRZ → llama3.2-vision:11b
-- PaddleOCR, docTR spatial extraction, regex fallback all removed
-- llama3.2-vision reads image directly — no OCR pre-step needed
-- PII stays local — no external APIs
-- Docker container clean, server.js Textract logic correctly nested in Python catch block
-- Node.js timeout bumped to 120s for vision model load time
-
-### Next steps
-- Tune llama3.2-vision prompt — check raw model response in Docker logs first
-- Test across ID types: NY permit, standard DL front, passport
-- On-device barcode decode (React Native Vision Camera) — eliminates server round-trip for ~70% of DL scans
-- Frontend form field mapping — `app/form.tsx` consuming structured schema
+- `backend/package.json` contains legacy deps (`openai`, `@google-cloud/vision`, `tesseract.js`, `sharp`, `mrz`) from prior pipeline iterations — they are not imported in `server.js`
 
 ## Environment
 
@@ -170,7 +241,7 @@ AWS_REGION=us-east-1
 
 ```bash
 brew install tesseract zbar
-ollama pull gemma3:4b  # pull model once
+ollama pull llama3.2-vision:11b  # pull model once (~8GB)
 ```
 
 ## Docker
@@ -179,3 +250,7 @@ Models pre-baked at build time — no downloads at runtime:
 - docTR: `db_resnet50` + `parseq`
 
 System deps: `tesseract-ocr`, `libgl1`, `libglib2.0-0`, `libzbar0`.
+
+`PYTHONUNBUFFERED=1` is set in `docker-compose.yml`. Without it the `[PY]` pipeline logs
+sit in stdout's buffer and never reach `docker-compose logs` while you're debugging a scan.
+`zxing-cpp` ships prebuilt wheels, so it needs no extra system packages.

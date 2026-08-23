@@ -4,11 +4,18 @@ import { CameraView, useCameraPermissions } from 'expo-camera';
 import type { CameraView as CameraViewType } from 'expo-camera';
 import { GestureDetector, Gesture } from 'react-native-gesture-handler';
 import * as ImagePicker from 'expo-image-picker';
+import { ImageManipulator, SaveFormat } from 'expo-image-manipulator';
 import { useRouter, Href } from 'expo-router';
 import { scanID } from './utils/ocr';
 import { useScan } from './context/ScanContext';
 
 type ScanState = 'camera' | 'processing' | 'success' | 'error';
+type Rect = { x: number; y: number; w: number; h: number };
+
+// Keep a margin around the guide frame so a card the user framed slightly loose
+// isn't clipped — the barcode sits right at the card edge. The server still runs
+// its own card detection on whatever we send.
+const CROP_PADDING = 0.12;
 
 export default function Scan() {
   const router = useRouter();
@@ -17,6 +24,19 @@ export default function Scan() {
   const [state, setState] = useState<ScanState>('camera');
   const [errorMsg, setErrorMsg] = useState('');
   const cameraRef = useRef<CameraViewType>(null);
+
+  // Measured in window coords so the on-screen guide frame can be mapped onto the
+  // captured photo. The frame used to be purely decorative — the full camera frame
+  // was sent, leaving the card a small region inside a tall photo.
+  const containerRef = useRef<View>(null);
+  const frameRef = useRef<View>(null);
+  const cameraRect = useRef<Rect | null>(null);
+  const guideRect = useRef<Rect | null>(null);
+
+  const measure = (ref: React.RefObject<View | null>, into: React.MutableRefObject<Rect | null>) => () =>
+    ref.current?.measureInWindow((x, y, w, h) => {
+      if (w > 0 && h > 0) into.current = { x, y, w, h };
+    });
 
   // Zoom state: default 0.03 for a slight zoom to help with ID scanning
   const DEFAULT_ZOOM = 0.03;
@@ -65,11 +85,68 @@ export default function Scan() {
     }
   };
 
+  /**
+   * Crop the capture down to the on-screen guide frame (plus padding).
+   * Returns the original URI unchanged if the geometry can't be trusted — a bad crop
+   * is far worse than none, since the server can still locate the card itself.
+   */
+  const cropToGuideFrame = async (photo: { uri: string; width: number; height: number }) => {
+    const cam = cameraRect.current;
+    const guide = guideRect.current;
+    if (!cam || !guide || !photo.width || !photo.height) return photo.uri;
+
+    // takePictureAsync may hand back a landscape buffer on some devices. Mapping a
+    // portrait preview onto it would crop the wrong region, so bail instead.
+    if (cam.h >= cam.w !== photo.height >= photo.width) {
+      console.log('[crop] orientation mismatch — sending full frame');
+      return photo.uri;
+    }
+
+    // The preview fills the view "cover"-style: scaled until both axes are covered, then centred.
+    const scale = Math.max(cam.w / photo.width, cam.h / photo.height);
+    if (!isFinite(scale) || scale <= 0) return photo.uri;
+    const offsetX = (photo.width * scale - cam.w) / 2;
+    const offsetY = (photo.height * scale - cam.h) / 2;
+
+    const padX = guide.w * CROP_PADDING;
+    const padY = guide.h * CROP_PADDING;
+
+    // Guide frame -> view coords -> photo pixels, then clamp to the image.
+    let originX = (guide.x - cam.x - padX + offsetX) / scale;
+    let originY = (guide.y - cam.y - padY + offsetY) / scale;
+    let width = (guide.w + padX * 2) / scale;
+    let height = (guide.h + padY * 2) / scale;
+
+    originX = Math.max(0, Math.min(originX, photo.width - 1));
+    originY = Math.max(0, Math.min(originY, photo.height - 1));
+    width = Math.max(1, Math.min(width, photo.width - originX));
+    height = Math.max(1, Math.min(height, photo.height - originY));
+
+    // Degenerate result means the maths went wrong somewhere — don't ship it.
+    if (width < photo.width * 0.2 || height < photo.height * 0.05) {
+      console.log('[crop] rect looks wrong — sending full frame');
+      return photo.uri;
+    }
+
+    try {
+      const rendered = await ImageManipulator.manipulate(photo.uri)
+        .crop({ originX: Math.round(originX), originY: Math.round(originY),
+                width: Math.round(width), height: Math.round(height) })
+        .renderAsync();
+      const result = await rendered.saveAsync({ format: SaveFormat.JPEG, compress: 0.95 });
+      console.log(`[crop] ${photo.width}x${photo.height} -> ${Math.round(width)}x${Math.round(height)}`);
+      return result.uri;
+    } catch (err) {
+      console.warn('[crop] failed, sending full frame:', err);
+      return photo.uri;
+    }
+  };
+
   const takePhoto = async () => {
     if (cameraRef.current) {
       const photo = await cameraRef.current.takePictureAsync({ quality: 1 });
       if (photo) {
-        await processImage(photo.uri);
+        await processImage(await cropToGuideFrame(photo));
       }
     }
   };
@@ -156,7 +233,7 @@ export default function Scan() {
 
   // Camera view
   return (
-    <View style={styles.cameraContainer}>
+    <View style={styles.cameraContainer} ref={containerRef} onLayout={measure(containerRef, cameraRect)}>
       <GestureDetector gesture={pinchGesture}>
         <CameraView ref={cameraRef} style={styles.camera} facing="back" zoom={zoom}>
           <View style={styles.overlay}>
@@ -169,7 +246,7 @@ export default function Scan() {
 
             {/* Scan frame */}
             <View style={styles.frameContainer}>
-              <View style={styles.scanFrame}>
+              <View style={styles.scanFrame} ref={frameRef} onLayout={measure(frameRef, guideRect)}>
                 <View style={[styles.corner, styles.topLeft]} />
                 <View style={[styles.corner, styles.topRight]} />
                 <View style={[styles.corner, styles.bottomLeft]} />

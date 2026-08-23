@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<title>ID Scanner</title>
+<style>
+  :root { --bg:#0b0d10; --panel:#151a21; --line:#252d38; --txt:#e8edf4; --dim:#8b97a8; --accent:#2f81f7; --ok:#2ea043; --warn:#d29922; --err:#f85149; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--txt);
+    font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  body { display:flex; flex-direction:column; }
+  header { padding:calc(env(safe-area-inset-top) + 10px) 16px 10px; display:flex; align-items:center; gap:10px;
+    border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0; font-weight:600; letter-spacing:-.01em; }
+  #dot { width:8px; height:8px; border-radius:50%; background:var(--dim); flex:none; }
+  #dot.ok { background:var(--ok); } #dot.err { background:var(--err); }
+  .seg { margin-left:auto; display:flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .seg button { background:transparent; color:var(--dim); border:0; padding:6px 12px; font-size:13px; font-weight:600; }
+  .seg button.on { background:var(--accent); color:#fff; }
+
+  main { flex:1; position:relative; overflow:hidden; background:#000; }
+  video, #shot { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; display:block; }
+  #shot { display:none; object-fit:contain; background:#000; }
+  #guide { position:absolute; inset:0; display:none; pointer-events:none; }
+  #guide .box { position:absolute; border:2px dashed rgba(255,255,255,.75); border-radius:12px;
+    box-shadow:0 0 0 100vmax rgba(0,0,0,.45); }
+  #hint { position:absolute; left:0; right:0; bottom:12px; text-align:center; font-size:13px;
+    color:#fff; text-shadow:0 1px 3px #000; padding:0 20px; }
+  #idle { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:14px; padding:24px; text-align:center; }
+
+  footer { padding:12px 16px calc(env(safe-area-inset-bottom) + 12px); border-top:1px solid var(--line);
+    display:flex; gap:10px; align-items:center; }
+  button.act { flex:1; background:var(--accent); color:#fff; border:0; border-radius:10px;
+    padding:14px; font-size:16px; font-weight:600; }
+  button.act[disabled] { opacity:.45; }
+  button.ghost { background:var(--panel); color:var(--txt); border:1px solid var(--line); }
+  label.file { display:block; }
+  label.file input { display:none; }
+
+  #out { display:none; padding:14px 16px calc(env(safe-area-inset-bottom) + 16px); overflow-y:auto; flex:1; }
+  .meta { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }
+  .chip { font-size:12px; padding:4px 9px; border-radius:999px; background:var(--panel);
+    border:1px solid var(--line); color:var(--dim); }
+  .chip b { color:var(--txt); font-weight:600; }
+  table { width:100%; border-collapse:collapse; }
+  td { padding:9px 4px; border-bottom:1px solid var(--line); vertical-align:top; font-size:14px; }
+  td.k { color:var(--dim); width:38%; }
+  td.v { font-weight:600; word-break:break-word; }
+  td.v.miss { color:var(--dim); font-weight:400; font-style:italic; }
+  .src { font-size:11px; color:var(--dim); font-weight:400; display:block; margin-top:2px; }
+  #msg { padding:12px 14px; border-radius:10px; font-size:14px; margin-bottom:12px; display:none; }
+  #msg.err { display:block; background:rgba(248,81,73,.12); border:1px solid rgba(248,81,73,.4); color:#ffb3ae; }
+  #msg.warn { display:block; background:rgba(210,153,34,.12); border:1px solid rgba(210,153,34,.4); color:#ffd97a; }
+  #msg.flip { display:block; background:rgba(47,129,247,.12); border:1px solid rgba(47,129,247,.45); color:#a9ccff; }
+  #msg .t { font-weight:600; margin-bottom:4px; }
+  #msg button { margin-top:10px; width:100%; background:var(--accent); color:#fff; border:0;
+    border-radius:8px; padding:11px; font-size:15px; font-weight:600; }
+  .spin { width:34px; height:34px; border:3px solid var(--line); border-top-color:var(--accent);
+    border-radius:50%; animation:s .8s linear infinite; }
+  @keyframes s { to { transform:rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<header>
+  <span id="dot"></span>
+  <h1>ID Scanner</h1>
+  <div class="seg">
+    <button id="sBack" class="on">Back</button>
+    <button id="sFront">Front</button>
+  </div>
+</header>
+
+<main>
+  <video id="cam" playsinline muted autoplay></video>
+  <img id="shot" alt="">
+  <div id="guide"><div class="box"></div></div>
+  <div id="hint">Fill the frame with the card — barcode side reads most accurately</div>
+  <div id="idle">
+    <div class="spin" id="spin" style="display:none"></div>
+    <p id="idleTxt" style="color:#8b97a8;margin:0">Tap <b style="color:#e8edf4">Start camera</b> to begin</p>
+  </div>
+</main>
+
+<div id="out">
+  <div id="msg"></div>
+  <div class="meta" id="meta"></div>
+  <table id="tbl"></table>
+</div>
+
+<footer>
+  <button class="act" id="go">Start camera</button>
+  <label class="file"><input type="file" accept="image/*" id="pick">
+    <span class="act ghost" style="display:block;text-align:center;padding:14px 16px;border-radius:10px;font-weight:600">Photo</span>
+  </label>
+</footer>
+
+<script>
+// ID-1 (driver's licence) aspect. The guide box and the crop both use it.
+const ID1 = 1.586, PAD = 0.12;
+const FIELDS = ['name','dateOfBirth','address','idNumber','expiryDate','issueDate','sex','state','documentType'];
+
+const $ = s => document.querySelector(s);
+const cam=$('#cam'), shot=$('#shot'), guide=$('#guide'), box=$('.box'), hint=$('#hint');
+const idle=$('#idle'), idleTxt=$('#idleTxt'), spin=$('#spin'), go=$('#go'), pick=$('#pick');
+const out=$('#out'), tbl=$('#tbl'), meta=$('#meta'), msg=$('#msg'), dot=$('#dot');
+let stream=null, side='back', busy=false;
+
+$('#sBack').onclick  = () => setSide('back');
+$('#sFront').onclick = () => setSide('front');
+function setSide(s){ side=s; $('#sBack').classList.toggle('on',s==='back'); $('#sFront').classList.toggle('on',s==='front');
+  hint.textContent = s==='back' ? 'Fill the frame with the card — barcode side reads most accurately'
+                                : 'Front side needs the vision model — slower, less exact'; }
+
+// Health probe so a dead backend is obvious before you waste a capture.
+fetch('/', {headers:{'ngrok-skip-browser-warning':'true'}}).then(r=>r.json())
+  .then(d => { dot.className = d.python_ocr==='available' ? 'ok':'err';
+               dot.title = 'python_ocr: '+d.python_ocr; })
+  .catch(()=> dot.className='err');
+
+function layoutGuide(){
+  const m=$('main').getBoundingClientRect();
+  let w=m.width*0.90, h=w/ID1;
+  if (h > m.height*0.62){ h=m.height*0.62; w=h*ID1; }
+  box.style.width=w+'px'; box.style.height=h+'px';
+  box.style.left=(m.width-w)/2+'px'; box.style.top=(m.height-h)/2+'px';
+}
+addEventListener('resize', layoutGuide);
+
+go.onclick = () => { if (busy) return; stream ? capture() : start(); };
+
+async function start(){
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({
+      video:{ facingMode:{ideal:'environment'}, width:{ideal:3840}, height:{ideal:2160} }, audio:false });
+    cam.srcObject = stream; await cam.play();
+    idle.style.display='none'; guide.style.display='block'; layoutGuide();
+    go.textContent='Capture';
+  }catch(e){
+    idleTxt.innerHTML = 'Camera unavailable — use <b style="color:#e8edf4">Photo</b> instead.<br><span style="font-size:12px">'+e.name+'</span>';
+  }
+}
+
+/** Crop the frame to the guide box (+padding) so the card fills the upload. */
+function cropToGuide(){
+  const m=$('main').getBoundingClientRect(), b=box.getBoundingClientRect();
+  const vw=cam.videoWidth, vh=cam.videoHeight;
+  // Preview is object-fit:cover — undo that scale and centring.
+  const sc=Math.max(m.width/vw, m.height/vh);
+  const ox=(vw*sc-m.width)/2, oy=(vh*sc-m.height)/2;
+  const px=b.width*PAD, py=b.height*PAD;
+  let sx=((b.left-m.left)-px+ox)/sc, sy=((b.top-m.top)-py+oy)/sc;
+  let sw=(b.width+px*2)/sc, sh=(b.height+py*2)/sc;
+  sx=Math.max(0,Math.min(sx,vw-1)); sy=Math.max(0,Math.min(sy,vh-1));
+  sw=Math.max(1,Math.min(sw,vw-sx)); sh=Math.max(1,Math.min(sh,vh-sy));
+
+  // Cap the long edge: full-res frames are slow over a tunnel and buy no accuracy.
+  const MAX=1800, k=Math.min(1, MAX/Math.max(sw,sh));
+  const c=document.createElement('canvas');
+  c.width=Math.round(sw*k); c.height=Math.round(sh*k);
+  c.getContext('2d').drawImage(cam, sx,sy,sw,sh, 0,0,c.width,c.height);
+  return c.toDataURL('image/jpeg', 0.92);
+}
+
+function capture(){ send(cropToGuide()); }
+
+pick.onchange = e => {
+  const f=e.target.files[0]; if(!f) return;
+  const r=new FileReader();
+  r.onload = () => {                       // downscale, but never crop a gallery pick
+    const im=new Image();
+    im.onload = () => {
+      const MAX=1800, k=Math.min(1, MAX/Math.max(im.width,im.height));
+      const c=document.createElement('canvas');
+      c.width=Math.round(im.width*k); c.height=Math.round(im.height*k);
+      c.getContext('2d').drawImage(im,0,0,c.width,c.height);
+      send(c.toDataURL('image/jpeg',0.92));
+    };
+    im.src=r.result;
+  };
+  r.readAsDataURL(f);
+  e.target.value='';
+};
+
+async function send(dataUrl){
+  busy=true; go.disabled=true; pick.disabled=true;
+  shot.src=dataUrl; shot.style.display='block'; cam.style.display='none';
+  guide.style.display='none'; hint.style.display='none';
+  idle.style.display='flex'; spin.style.display='block'; idleTxt.textContent='Reading card…';
+  out.style.display='none';
+  const t0=Date.now();
+  try{
+    const res = await fetch('/api/scan', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','ngrok-skip-browser-warning':'true'},
+      body: JSON.stringify({ image:dataUrl, side })
+    });
+    const txt = await res.text();
+    let j; try { j=JSON.parse(txt); }
+    catch { throw new Error('Server sent non-JSON (HTTP '+res.status+'): '+txt.slice(0,120)); }
+    if(!res.ok) throw new Error(j.message||j.error||('HTTP '+res.status));
+    render(j, Date.now()-t0);
+  }catch(err){
+    render(null, Date.now()-t0, err.message);
+  }finally{
+    busy=false; go.disabled=false; pick.disabled=false;
+    spin.style.display='none'; idle.style.display='none';
+    go.textContent = stream ? 'Capture again' : 'Start camera';
+  }
+}
+
+/**
+ * Work out whether the captured side matches the one selected.
+ *
+ * `source` is the tell. Only the back carries a PDF417, so source==='barcode' proves the
+ * back was shown. Conversely the back has no readable name/DOB text — so if the vision
+ * model returned real fields, what it read was a front.
+ */
+function sideCheck(source, got){
+  if(side === 'back'){
+    if(source === 'barcode') return null;                      // right side, exact read
+    if(got > 0) return {
+      kind:'flip',
+      title:'That looks like the front of the card',
+      body:'These fields came from the vision model, which only reads the front — so they are a '+
+           'best guess, not exact. You selected Back, where the barcode is. Flip the card over '+
+           'and capture again for an exact read.',
+      // The card is wrong, not the toggle — keep Back selected.
+      action:{ label:'Capture the barcode side', setTo:null } };
+    return {
+      kind:'warn',
+      title:'No barcode found',
+      body:'Show the barcode side, flat and fully inside the frame. Glare across the barcode will also block it.',
+      action:{ label:'Try again', setTo:null } };
+  }
+  // side === 'front'
+  if(got > 0) return null;
+  return {
+    kind:'flip',
+    title:'Nothing readable on this side',
+    body:'If what you are holding is the barcode side, switch to Back — it reads exactly and instantly.',
+    action:{ label:'Switch to Back and retry', setTo:'back' } };
+}
+
+function render(j, ms, errText){
+  out.style.display='block';
+  msg.className=''; msg.innerHTML='';
+  if(errText){ msg.className='err'; msg.textContent=errText; tbl.innerHTML=''; meta.innerHTML=''; return; }
+
+  const d=j.data||{}, got=FIELDS.filter(k=>d[k]).length;
+  meta.innerHTML =
+    `<span class="chip">source <b>${j.source??'—'}</b></span>`+
+    `<span class="chip">confidence <b>${j.confidence!=null?Math.round(j.confidence*100)+'%':'—'}</b></span>`+
+    `<span class="chip">fields <b>${got}/${FIELDS.length}</b></span>`+
+    `<span class="chip">time <b>${(ms/1000).toFixed(1)}s</b></span>`;
+
+  const advice = sideCheck(j.source, got);
+  if(advice){
+    msg.className = advice.kind === 'flip' ? 'flip' : 'warn';
+    msg.innerHTML = `<div class="t">${esc(advice.title)}</div>${esc(advice.body)}`;
+    if(advice.action){
+      const b=document.createElement('button');
+      b.textContent = advice.action.label;
+      b.onclick = () => { if(advice.action.setTo) setSide(advice.action.setTo); retake(); };
+      msg.appendChild(b);
+    }
+  }
+
+  tbl.innerHTML = FIELDS.map(k=>{
+    const v=d[k];
+    return `<tr><td class="k">${k}</td><td class="v${v?'':' miss'}">${v?esc(v):'not found'}</td></tr>`;
+  }).join('');
+}
+
+/** Back to a live viewfinder so the corrected side can be captured immediately. */
+function retake(){
+  out.style.display='none';
+  shot.style.display='none'; cam.style.display='block'; hint.style.display='block';
+  if(stream){ guide.style.display='block'; layoutGuide(); go.textContent='Capture'; }
+  else { idle.style.display='flex'; idleTxt.innerHTML='Tap <b style="color:#e8edf4">Start camera</b> to begin'; }
+  window.scrollTo(0,0);
+}
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+</script>
+</body>
+</html>

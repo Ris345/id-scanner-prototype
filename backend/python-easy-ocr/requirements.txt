@@ -4,6 +4,8 @@ flask
 pillow
 numpy
 passporteye
+zxing-cpp
+# pyzbar is kept only as a secondary attempt — its PDF417 decoder returns no data
 pyzbar
 scikit-image
 pytesseract

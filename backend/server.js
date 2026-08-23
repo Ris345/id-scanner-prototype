@@ -116,11 +116,15 @@ async function scanWithPython(imageBuffer, side) {
   const body = { image: imageBuffer.toString('base64') };
   if (side) body.side = side;
 
+  // Must outlast the Python side's Ollama timeout (OLLAMA_TIMEOUT, default 180s) plus the
+  // barcode/MRZ stages ahead of it — otherwise Node gives up first and the real result is lost.
+  const SCAN_TIMEOUT_MS = Number(process.env.SCAN_TIMEOUT_MS || 210000);
+
   const res = await fetch(`${PYTHON_OCR_URL}/ocr`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(120000),
+    signal: AbortSignal.timeout(SCAN_TIMEOUT_MS),
   });
 
   if (!res.ok) {
@@ -133,7 +137,8 @@ async function scanWithPython(imageBuffer, side) {
 
   const rawText   = ocrResult.raw_text || '';
   const confidence = ocrResult.confidence || 0;
-  console.log(`[Python] confidence: ${typeof confidence === 'number' ? confidence.toFixed(1) : confidence}%`);
+  // Python emits a 0–1 float, not a percentage.
+  console.log(`[Python] confidence: ${typeof confidence === 'number' ? (confidence * 100).toFixed(1) + '%' : confidence}`);
   console.log(`[Python] raw text:\n${rawText}`);
 
   const f = ocrResult.fields || {};
@@ -173,7 +178,7 @@ function logScanResult(data, source, confidence) {
   console.log(`[Node]  SCAN RESULT  (this is the Node server — Python is [PY])`);
   console.log(`[Node] ${SEP2}`);
   console.log(`[Node]  source     : ${source}`);
-  console.log(`[Node]  confidence : ${typeof confidence === 'number' ? confidence.toFixed(1) + '%' : confidence ?? '—'}`);
+  console.log(`[Node]  confidence : ${typeof confidence === 'number' ? (confidence * 100).toFixed(1) + '%' : confidence ?? '—'}`);
   console.log(`[Node] ${SEP}`);
   console.log(row('name',         data.name));
   console.log(row('dateOfBirth',  data.dateOfBirth));
@@ -188,6 +193,11 @@ function logScanResult(data, source, confidence) {
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
+
+// Browser scanner UI — open this on a phone over the ngrok HTTPS URL. Served on an
+// explicit path so `/` stays the JSON health check that the page itself probes.
+app.get('/scan', (req, res) => res.sendFile(path.join(__dirname, 'public', 'scan.html')));
+
 app.get('/', async (req, res) => {
   let pythonAlive = false;
   try {
