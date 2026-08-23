@@ -41,9 +41,18 @@ else:
     device = torch.device('cpu')
 print(f"[Device] {device}")
 
-print("[docTR] Loading model...")
-ocr_model = ocr_predictor(det_arch='db_resnet50', reco_arch='parseq', pretrained=True).to(device)
-print("[docTR] Ready.")
+# docTR is a leftover from the pre-vision-model pipeline and is not called by /ocr. It is
+# kept — and pre-baked into the image — so it can be re-wired without a rebuild, but loading
+# it eagerly cost ~1GB of RSS and most of the healthcheck's start_period for nothing.
+_ocr_model = None
+
+def get_ocr_model():
+    global _ocr_model
+    if _ocr_model is None:
+        print('[docTR] Loading model...')
+        _ocr_model = ocr_predictor(det_arch='db_resnet50', reco_arch='parseq', pretrained=True).to(device)
+        print('[docTR] Ready.')
+    return _ocr_model
 
 # ── Ollama ─────────────────────────────────────────────────────────────────────
 OLLAMA_ENABLED = os.environ.get('OLLAMA_ENABLED', 'true').lower() != 'false'
@@ -63,6 +72,10 @@ print(f'[Ollama] {"enabled" if OLLAMA_ENABLED else "disabled"}  model={OLLAMA_MO
 REQUIRED_FIELDS = ['name', 'dateOfBirth', 'idNumber']
 CONF_THRESHOLD  = 0.75
 VALID_OUTPUT    = {'name', 'dateOfBirth', 'idNumber', 'expiryDate', 'issueDate', 'sex', 'address', 'state'}
+
+# documentType is deliberately NOT in VALID_OUTPUT: it is a top-level response key, not one
+# of the {value, confidence, source} field objects. try_ollama() returns it separately.
+DOC_TYPES = ('dl', 'state_id', 'passport')
 
 AAMVA_MAP = {
     'DCS': 'lastName',    'DAC': 'firstName',  'DCT': 'firstName',
@@ -361,29 +374,58 @@ def try_mrz(img_bytes):
         return {}, 'unknown'
 
 
-# ── Stage 3: Tesseract — raw text extraction ───────────────────────────────────
+# ── Stage 4: Tesseract — raw text safety net ───────────────────────────────────
+# Runs only when the structured stages came back incomplete. It does not produce
+# fields; it produces the `raw_text` the form screen shows so that a scan which
+# barcode/MRZ/Ollama all missed still hands the user something to type from,
+# instead of "No text detected".
 
 def try_tesseract(img):
-    # Tesseract works best on high-contrast grayscale — convert and threshold
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    pil_img = Image.fromarray(thresh)
+    try:
+        # Tesseract works best on high-contrast grayscale — convert and threshold
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        pil_img = Image.fromarray(thresh)
 
-    # PSM 11 = sparse text, handles scattered labels on ID cards
-    raw = pytesseract.image_to_string(pil_img, config='--psm 11 --oem 3')
-    lines = [l.strip() for l in raw.splitlines() if l.strip()]
-    raw_clean = '\n'.join(lines)
-    print(f'[PY][Tesseract] {len(lines)} lines')
-    print(f'[PY][Tesseract] Raw text:\n{raw_clean}')
-    return raw_clean
+        # PSM 11 = sparse text, handles scattered labels on ID cards
+        raw = pytesseract.image_to_string(pil_img, config='--psm 11 --oem 3')
+        lines = [l.strip() for l in raw.splitlines() if l.strip()]
+        raw_clean = '\n'.join(lines)
+        print(f'[PY][Tesseract] {len(lines)} lines of raw text')
+        return raw_clean
+    except Exception as e:
+        # A missing tesseract binary must not take down a scan that already has fields.
+        print(f'[PY][Tesseract] Failed: {e}')
+        return ''
 
 
 # ── Stage 3: Ollama vision ─────────────────────────────────────────────────────
 
-def try_ollama(img_bytes, partial_fields):
+def _normalize_doc_type(v):
+    """Map whatever the model calls the document onto our four-value vocabulary.
+
+    Order matters. "non-driver ID" is the standard name for a state ID card and
+    contains "driver", so the negations have to be tested before the DL rule.
+    """
+    s = str(v or '').strip().lower()
+    if s in DOC_TYPES:
+        return s
+    if 'passport' in s:
+        return 'passport'
+    if 'non-driver' in s or 'non driver' in s or 'nondriver' in s:
+        return 'state_id'
+    if 'driver' in s or 'permit' in s or 'learner' in s or s in ('dl', 'dln'):
+        return 'dl'
+    if 'identification' in s or re.search(r'\bid\b', s):
+        return 'state_id'
+    return 'unknown'
+
+
+def try_ollama(img_bytes):
+    """Returns (fields, doc_type)."""
     if not OLLAMA_ENABLED:
-        return {}
+        return {}, 'unknown'
 
     # Framed as transcription rather than "extract personal information from an ID", which
     # llama3.2-vision intermittently refuses outright ("...not within my ethical guidelines").
@@ -393,9 +435,12 @@ def try_ollama(img_bytes, partial_fields):
         "The document owner is scanning it themselves to fill in a form, so read it verbatim. "
         "Reply with only a JSON object using exactly these keys:\n"
         '{"name":"FIRST MIDDLE LAST","dateOfBirth":"MM/DD/YYYY","idNumber":"...","expiryDate":"MM/DD/YYYY",'
-        '"issueDate":"MM/DD/YYYY","sex":"M or F or X","address":"full address","state":"state name"}\n\n'
+        '"issueDate":"MM/DD/YYYY","sex":"M or F or X","address":"full address","state":"state name",'
+        '"documentType":"dl or state_id or passport"}\n\n'
         "Rules:\n"
         "- name: first name then last name order (e.g. JOHN SMITH not SMITH JOHN)\n"
+        "- documentType: dl for a driver licence or learner permit, state_id for a "
+        "non-driver ID card, passport for a passport\n"
         "- dates: MM/DD/YYYY format only\n"
         "- idNumber: digits only, no dashes or spaces\n"
         "- Use null for any field that is not legible\n"
@@ -418,21 +463,22 @@ def try_ollama(img_bytes, partial_fields):
         match = re.search(r'\{.*\}', text, re.DOTALL)
         if not match:
             print(f'[PY][Ollama] No JSON in response: {text[:200]}')
-            return {}
+            return {}, 'unknown'
         parsed = json.loads(match.group())
         if not isinstance(parsed, dict):
             print(f'[PY][Ollama] Expected an object, got {type(parsed).__name__}')
-            return {}
+            return {}, 'unknown'
         fields = {
             k: mk(str(v), 0.70, 'ollama')
             for k, v in parsed.items()
             if k in VALID_OUTPUT and v and v not in (None, 'null')
         }
-        print(f'[PY][Ollama] {len(fields)} fields extracted')
-        return fields
+        doc_type = _normalize_doc_type(parsed.get('documentType'))
+        print(f'[PY][Ollama] {len(fields)} fields extracted  doc_type={doc_type}')
+        return fields, doc_type
     except Exception as e:
         print(f'[PY][Ollama] Failed: {e}')
-        return {}
+        return {}, 'unknown'
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -489,24 +535,38 @@ def ocr():
 
     # Stage 3: Ollama vision — gets its own smaller copy; see downscale().
     ollama_bytes = to_jpeg_bytes(downscale(card, OLLAMA_MAX_EDGE)) or card_bytes
-    ollama_fields = try_ollama(ollama_bytes, fields)
+    ollama_fields, ollama_type = try_ollama(ollama_bytes)
     if ollama_fields:
         fields = merge(fields, ollama_fields)
         source = 'llama-vision'
     elif fields:
         source = 'barcode' if doc_type in ('dl', 'state_id') else 'mrz'
+    # Barcode and MRZ read the document's own machine-readable declaration, so they win.
+    # The model only fills the gap they leave — chiefly a front-of-card scan.
+    if doc_type == 'unknown' and ollama_type != 'unknown':
+        doc_type = ollama_type
 
-    return _respond(fields, source, doc_type, card)
+    # Stage 4: Tesseract safety net. Only worth its ~1-2s when the structured stages
+    # left us short — a complete result has nothing to gain from raw text.
+    raw_text = ''
+    if not is_complete(fields):
+        raw_text = try_tesseract(card)
+        if raw_text and not fields:
+            # Nothing structured at all. Saying so lets the client show the raw text
+            # rather than the "No text detected" dead end.
+            source = 'tesseract'
+
+    return _respond(fields, source, doc_type, card, raw_text)
 
 
-def _respond(fields, source, doc_type, img):
+def _respond(fields, source, doc_type, img, raw_text=''):
     gray        = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     glare_ratio = float(np.count_nonzero(gray > 240)) / gray.size
     warnings    = ['glare_detected'] if glare_ratio > 0.15 else []
     confs       = [fields[f]['confidence'] for f in REQUIRED_FIELDS if fields.get(f)]
     confidence  = round(min(confs), 4) if confs else 0.0
 
-    _log(fields, source, confidence)
+    _log(fields, source, confidence, doc_type, raw_text)
     return jsonify({
         'success':      True,
         'source':       source,
@@ -514,13 +574,15 @@ def _respond(fields, source, doc_type, img):
         'confidence':   confidence,
         'fields':       fields,
         'warnings':     warnings,
+        # server.js reads this as `raw_text` and forwards it to the client as `rawText`.
+        'raw_text':     raw_text,
     })
 
 
-def _log(fields, source, confidence):
+def _log(fields, source, confidence, doc_type='unknown', raw_text=''):
     SEP = '─' * 50
     print(f'\n[PY] {"═"*50}')
-    print(f'[PY] RESULT  source={source}  conf={confidence:.2f}')
+    print(f'[PY] RESULT  source={source}  conf={confidence:.2f}  doc_type={doc_type}')
     print(f'[PY] {SEP}')
     for f in ['name', 'dateOfBirth', 'idNumber', 'expiryDate', 'issueDate', 'sex', 'address', 'state']:
         entry = fields.get(f)
@@ -528,6 +590,11 @@ def _log(fields, source, confidence):
             print(f'[PY]   {f:<14} conf={entry["confidence"]:.2f}  src={entry["source"]}')
         else:
             print(f'[PY]   {f:<14} <-- MISSING')
+    if raw_text:
+        print(f'[PY] {SEP}')
+        print(f'[PY] raw_text ({len(raw_text)} chars):')
+        for line in raw_text.splitlines():
+            print(f'[PY]   {line}')
     print(f'[PY] {"═"*50}\n')
 
 

@@ -47,8 +47,9 @@ services:
       interval: 10s
       timeout: 5s
       retries: 30
-      # docTR loads its model at import; the first start is slow.
-      start_period: 90s
+      # Only torch and the decoders load at import now — docTR is lazy and unused
+      # by /ocr, so the service is ready in seconds rather than a minute and a half.
+      start_period: 30s
     restart: unless-stopped
 
   # Opt-in: `docker-compose --profile ollama up -d`. Off by default because a

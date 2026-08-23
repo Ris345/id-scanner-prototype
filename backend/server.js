@@ -10,6 +10,10 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const PYTHON_OCR_URL = process.env.PYTHON_OCR_URL || 'http://localhost:3002';
 
+// Mirrors the Python service's stage order. Textract sits outside it — a crash-only
+// fallback for when the Python service is unreachable, not a low-confidence retry.
+const OCR_PIPELINE = 'PDF417 → MRZ → llama-vision → Tesseract raw text (Textract if Python is down)';
+
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
@@ -162,7 +166,7 @@ async function scanWithPython(imageBuffer, side) {
     documentType: ocrResult.documentType || null,
   };
 
-  const source = ocrResult.source || 'doctr+passporteye+barcode';
+  const source = ocrResult.source || 'none';
   console.log('[Python] parsed fields:', JSON.stringify(data, null, 2));
   return { data, rawText, source, confidence };
 }
@@ -206,8 +210,8 @@ app.get('/', async (req, res) => {
   } catch {}
   res.json({
     status: 'ID Scanner API running',
-    version: '8.0.0',
-    ocr: 'docTR+PassportEye+PDF417 → Textract field fallback → error',
+    version: '8.1.0',
+    ocr: OCR_PIPELINE,
     python_ocr: pythonAlive ? 'available' : 'unavailable',
     textract: textractAvailable() ? 'available' : 'unavailable',
   });
@@ -265,7 +269,7 @@ async function start() {
 ID Scanner Backend
 ━━━━━━━━━━━━━━━━━━━━━━
 Server:   http://localhost:${PORT}
-OCR:      docTR+PassportEye+PDF417 → Textract field fallback → error
+OCR:      ${OCR_PIPELINE}
 Python:   ${PYTHON_OCR_URL}
 Textract: ${textractAvailable() ? 'available' : 'unavailable (set AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY)'}
 

@@ -72,7 +72,7 @@ Do not remove it, and never run `docker-compose down --remove-orphans` from this
 
 ## OCR Pipeline
 
-**Priority order**: barcode > MRZ > llama3.2-vision > Textract (crash fallback only)
+**Priority order**: barcode > MRZ > llama3.2-vision > Tesseract raw text > Textract (crash fallback only)
 
 ```
 Image (full camera frame)
@@ -85,6 +85,10 @@ Image (full camera frame)
 2. MRZ (PassportEye)           → if found + checksum passes → return (confidence 0.98)
   ↓
 3. llama3.2-vision:11b (Ollama) → sends image directly, returns structured JSON fields
+  ↓
+4. Tesseract (raw text only)   → only if is_complete() is still false; fills `raw_text`,
+                                 never fields. Source becomes "tesseract" if it is the
+                                 only thing that found anything.
 ```
 
 - `POST /api/scan` → Python microservice always first
@@ -95,10 +99,24 @@ Image (full camera frame)
 - **The classifier only runs on a successful card crop.** On a full portrait frame it is meaningless — it classifies as `passport` and would skip the barcode stage on a driver's license. When `detect_card()` finds nothing, doc_class is forced to `unknown` so every stage still runs.
 - Node.js timeout: 120s (llama3.2-vision:11b is slow on first load, ~30–60s)
 
+### documentType
+
+Set by whichever stage identified the document: barcode (`dl` if a `DCA` vehicle class is
+present, else `state_id`), MRZ (from the MRZ type character), or — when both left it
+`unknown`, which is the normal case for a **front**-of-card scan — the vision model.
+
+`documentType` is deliberately **not** in `VALID_OUTPUT`. It is a top-level response key,
+not one of the `{value, confidence, source}` field objects, so `try_ollama()` returns it as
+the second element of its tuple. Adding it to `VALID_OUTPUT` would bury it inside `fields`,
+where `server.js` (which reads `ocrResult.documentType`) would never see it.
+
+`_normalize_doc_type()` maps the model's free text onto `dl` | `state_id` | `passport` |
+`unknown`. **Order of its checks matters**: "non-driver ID" is the standard name for a state
+ID card and contains "driver", so the negations are tested before the DL rule.
+
 ### Unused code in pipeline
 
-- `ocr_model` (docTR `db_resnet50` + `parseq`) is loaded at startup but **not called** in the `/ocr` route — it's a leftover from a prior pipeline; the Dockerfile pre-bakes it to avoid first-run downloads if it gets re-wired
-- `try_tesseract()` in `app.py` exists but is **not called** from `/ocr` — it's a dormant stage between MRZ and Ollama
+- `ocr_model` (docTR `db_resnet50` + `parseq`) is still **not called** in the `/ocr` route, but is now behind `get_ocr_model()` and loads lazily — eagerly loading it cost ~1GB RSS and most of the healthcheck's `start_period` for nothing. The Dockerfile still pre-bakes it so re-wiring needs no rebuild.
 - `parseIDText()` in `app/utils/idParser.ts` is legacy regex parsing — **not called** from `scan.tsx` or `ocr.ts`; the file's live purpose is the `ParsedID` interface
 
 ### Client-side cropping
@@ -126,11 +144,28 @@ Each field is a structured object — NOT a plain string:
 
 Per-field `source` values: `"barcode"` | `"mrz"` | `"ollama"` | (Textract fields are plain strings, no `.source`)
 
-Top-level response `source` field uses: `"barcode"` | `"mrz"` | `"llama-vision"` | `"textract"`
+Top-level response `source` field uses: `"barcode"` | `"mrz"` | `"llama-vision"` | `"tesseract"` | `"textract"` | `"none"`
 
 **server.js unwraps with**: `const fv = key => (f[key] && f[key].value) || null`
 
 Response also includes `warnings: ["glare_detected"]` if > 15% of image is blown out.
+
+### raw_text
+
+Python returns `raw_text` (snake_case); `server.js` forwards it to the client as `rawText`;
+`app/form.tsx` renders it and `scan.tsx` uses `hasRawText` (>20 chars) to decide whether a
+scan counts as a failure. That chain was dead for several iterations — Python had stopped
+emitting `raw_text` entirely, so `hasRawText` was permanently false and any scan that
+produced no fields hit "No text detected", even when the card was perfectly legible.
+
+`raw_text` is `''` on any complete result. Tesseract only runs when `is_complete()` is
+false, so the ~1–2s it costs is never paid on a clean barcode or MRZ scan.
+
+**A vision-only scan always pays it**, though: Ollama emits fields at `0.70` and
+`CONF_THRESHOLD` is `0.75`, so `is_complete()` is false by construction on a llama-vision
+result. That is deliberate rather than accidental — a 0.70 read is exactly the case where
+the user checking the form wants the verbatim text next to the parsed fields. Raising
+Ollama's confidence above 0.75 would silently switch this off.
 
 ## Output Fields
 
@@ -141,8 +176,8 @@ Response also includes `warnings: ["glare_detected"]` if > 15% of image is blown
 | File | Purpose |
 |------|---------|
 | `backend/server.js` | Express API, Python call, Textract crash fallback, `logScanResult()` |
-| `backend/python-easy-ocr/app.py` | OCR pipeline — barcode + MRZ + Ollama vision |
-| `backend/python-easy-ocr/Dockerfile` | Pre-bakes docTR models at build time (model loaded at startup, not used in scan path) |
+| `backend/python-easy-ocr/app.py` | OCR pipeline — barcode + MRZ + Ollama vision + Tesseract raw text |
+| `backend/python-easy-ocr/Dockerfile` | Pre-bakes docTR models at build time (loaded lazily, not used in scan path) |
 | `backend/python-easy-ocr/requirements.txt` | Python deps |
 | `app/utils/ocr.ts` | `scanID(uri, side?)` — frontend HTTP client |
 | `app/utils/idParser.ts` | `ParsedID` interface (+ legacy `parseIDText` not used in scan flow) |
@@ -153,8 +188,8 @@ Response also includes `warnings: ["glare_detected"]` if > 15% of image is blown
 ## Python Microservice Details
 
 ### Models
-- **docTR**: `db_resnet50` (detection) + `parseq` (recognition) — loaded at startup, not called in scan route
-- **Tesseract**: `try_tesseract()` defined but not wired into the `/ocr` route
+- **docTR**: `db_resnet50` (detection) + `parseq` (recognition) — **lazy** behind `get_ocr_model()`, still not called in the scan route
+- **Tesseract**: `try_tesseract()` is stage 4 — raw text only, never fields. Wrapped in a `try` so a missing `tesseract` binary degrades to `''` instead of failing a scan that already has fields.
 
 ### GPU detection
 Auto-detects CUDA → Apple MPS → CPU at startup.
