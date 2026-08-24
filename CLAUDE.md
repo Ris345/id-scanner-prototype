@@ -264,7 +264,10 @@ Key prefixes to watch:
 
 ## Environment
 
-AWS credentials in `backend/.env` are optional — Textract is crash fallback only.
+AWS credentials are optional — Textract is crash fallback only. They live in `.env` at the
+**project root**, not `backend/.env`: `server.js` loads `path.join(__dirname, '../.env')`.
+(In Docker `__dirname` is `/app`, so that path misses — compose passes the AWS vars through
+`environment:` instead.)
 
 ```
 AWS_ACCESS_KEY_ID=...
