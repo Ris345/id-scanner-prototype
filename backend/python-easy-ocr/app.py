@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 from PIL import Image
 from flask import Flask, request, jsonify
+from werkzeug.exceptions import HTTPException
 import torch
 import requests
 import pytesseract
@@ -105,19 +106,34 @@ def merge(base, supplement):
     return result
 
 def load_image(req):
+    """Returns (img, bytes, error). A non-None error means the *input* is bad, which is
+    a 400 — distinct from this service failing, and deliberately so: Node only falls back
+    to Textract when the service itself is unreachable, so a malformed upload must never
+    present as a crash or it would be forwarded to AWS."""
     if 'image' in req.files:
         data = req.files['image'].read()
     elif req.is_json and req.json.get('image'):
         b64 = req.json['image']
         if ',' in b64:
             b64 = b64.split(',', 1)[1]
-        data = base64.b64decode(b64)
+        try:
+            data = base64.b64decode(b64, validate=False)
+        except Exception:
+            return None, None, 'Image is not valid base64'
     else:
         return None, None, 'No image provided'
+
+    if not data:
+        return None, None, 'Image is empty'
+
     arr = np.frombuffer(data, np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    return img, data, None
+    if img is None:
+        # imdecode returns None rather than raising; without this check the cvtColor
+        # below raised, surfacing as an HTML 500 that Node read as "service is down".
+        return None, None, 'Image could not be decoded — not a supported image format'
+
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB), data, None
 
 def preprocess(img):
     h, w = img.shape[:2]
@@ -488,11 +504,31 @@ def health():
     return jsonify({'status': 'ok', 'device': str(device)})
 
 
+@app.errorhandler(Exception)
+def _unhandled(e):
+    """Flask's default error page is HTML. Node parses this service's replies as JSON and
+    treats a parse failure as 'the service is down', which is the branch that forwards the
+    image to Textract — so an unhandled bug here would silently ship an ID to AWS. Always
+    answer in JSON so that branch is reserved for the service genuinely being unreachable.
+
+    HTTPException is re-raised with its own status: this handler catches those too, and
+    without the passthrough a 404 or a 405 would be reported to Node as a 500 — i.e. as
+    'the service is unwell', which is exactly the misclassification this exists to prevent.
+    """
+    if isinstance(e, HTTPException):
+        return jsonify({'success': False, 'error': e.description, 'bad_input': e.code < 500}), e.code
+    import traceback
+    print(f'[PY] UNHANDLED: {type(e).__name__}: {e}')
+    traceback.print_exc()
+    return jsonify({'success': False, 'error': f'{type(e).__name__}: {e}'}), 500
+
+
 @app.route('/ocr', methods=['POST'])
 def ocr():
     img, img_bytes, err = load_image(request)
     if err:
-        return jsonify({'success': False, 'error': err}), 400
+        print(f'[PY] BAD INPUT: {err}')
+        return jsonify({'success': False, 'error': err, 'bad_input': True}), 400
 
     body     = request.json if request.is_json else {}
     side     = body.get('side')

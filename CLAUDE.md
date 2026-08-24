@@ -93,7 +93,7 @@ Image (full camera frame)
 
 - `POST /api/scan` → Python microservice always first
 - **Ollama receives the raw image bytes** — vision model reads the ID card directly, no OCR pre-step
-- **Textract**: only fires in Node.js if the Python service throws entirely
+- **Textract**: only fires in Node.js if the Python service is *unreachable* — never on a rejected image (see "The Textract boundary")
 - Optional `side: 'front' | 'back'` in request body skips irrelevant stages
 - Document classifier (aspect ratio) gates which stages run: `dl_or_stateid` | `passport` | `unknown`
 - **The classifier only runs on a successful card crop.** On a full portrait frame it is meaningless — it classifies as `passport` and would skip the barcode stage on a driver's license. When `detect_card()` finds nothing, doc_class is forced to `unknown` so every stage still runs.
@@ -259,7 +259,16 @@ Key prefixes to watch:
 - `scanWithPython()` unwraps `.value` from structured fields via `fv(key)` helper
 - `confidence` passed through from Python response
 - `logScanResult()` prints `[Node]` summary after every scan
-- **Textract fires only if Python service throws** — not on low confidence
+- **Textract fires only if the Python service is unreachable** — not on low confidence, and not on a rejected image
+
+### The Textract boundary
+
+Textract is the one path that sends the user's ID off the machine, so what may cross it is
+narrow and deliberate: **only a genuinely unreachable Python service.**
+
+- Python returns **4xx** for a bad *input* (undecodable bytes, empty body, no image). `scanWithPython()` tags these `err.badInput` and `/api/scan` returns 400 **without** calling Textract — no cloud OCR can turn an undecodable upload into fields, so the call would only leak the image to reach the same answer.
+- Python's `@app.errorhandler(Exception)` guarantees a **JSON** reply. Flask's default HTML error page made Node's `res.json()` throw, which is indistinguishable from the service being down — so any unhandled bug used to route the image to AWS. It re-raises `HTTPException` with its own status, or a 404/405 would report as a 500 and hit that same branch.
+- `cv2.imdecode()` returns `None` instead of raising on a corrupt image; `load_image()` checks for it explicitly. Without that check `cvtColor` raised, which was exactly the HTML-500 case above.
 - `backend/package.json` contains legacy deps (`openai`, `@google-cloud/vision`, `tesseract.js`, `sharp`, `mrz`) from prior pipeline iterations — they are not imported in `server.js`
 
 ## Environment

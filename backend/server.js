@@ -133,7 +133,16 @@ async function scanWithPython(imageBuffer, side) {
 
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`Python OCR service error ${res.status}: ${text}`);
+    let detail = text;
+    try { detail = JSON.parse(text).error || text; } catch {}
+
+    // A 4xx means the *image* was rejected, not that the service is unwell. Textract is a
+    // crash-only fallback, so retrying bad input against a paid cloud OCR service would
+    // both waste the call and send the user's ID to AWS for no possible benefit.
+    const err = new Error(`Python OCR service error ${res.status}: ${detail}`);
+    err.badInput = res.status >= 400 && res.status < 500;
+    err.status = res.status;
+    throw err;
   }
 
   const ocrResult = await res.json();
@@ -239,6 +248,14 @@ app.post('/api/scan', upload.single('image'), async (req, res) => {
       logScanResult(result.data, result.source, result.confidence ?? null);
       return res.json({ success: true, ...result });
     } catch (pythonErr) {
+      // Rejected image: the pipeline worked, the input was unusable. Say so and stop —
+      // no fallback can turn an undecodable upload into fields, and Textract would only
+      // send it to AWS to reach the same conclusion.
+      if (pythonErr.badInput) {
+        console.warn('[Node] Bad input, not falling back:', pythonErr.message);
+        return res.status(400).json({ error: pythonErr.message.replace(/^Python OCR service error \d+: /, '') });
+      }
+
       console.warn('[Node] Python service failed:', pythonErr.message);
 
       // ── Fallback: Textract — only if Python crashed AND creds are set ─────────
