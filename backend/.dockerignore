@@ -1,0 +1,13 @@
+# Reinstalled inside the image — copying the host's would be slow and wrong-platform.
+node_modules
+
+# The Python service has its own build context; nothing here needs it.
+python-easy-ocr
+
+# Unused legacy Tesseract data (5MB), not read by server.js
+*.traineddata
+
+.env
+.env.*
+npm-debug.log*
+.DS_Store

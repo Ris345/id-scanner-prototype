@@ -1,6 +1,68 @@
+# Pinned explicitly. Compose otherwise derives the project name from this directory
+# ("backend"), which collides with every other project on the machine that also has a
+# backend/ dir — a `up -d` then adopts and recreates their identically-named services.
+name: id-scanner
+
 services:
+  backend:
+    build: .
+    ports:
+      - "3001:3001"
+    environment:
+      - PORT=3001
+      # Service name, not localhost — localhost inside this container is the container itself.
+      - PYTHON_OCR_URL=http://python-ocr:3002
+      # Textract is a crash-only fallback and stays inert unless these are set.
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+    volumes:
+      # Edit server.js on the host, then `docker-compose restart backend`.
+      - ./server.js:/app/server.js:ro
+      # Browser scanner UI — edit and just reload the page, no restart needed.
+      - ./public:/app/public:ro
+    depends_on:
+      python-ocr:
+        condition: service_healthy
+    restart: unless-stopped
+
   python-ocr:
     build: ./python-easy-ocr
     ports:
       - "3002:3002"
+    environment:
+      # Without this the [PY] pipeline logs sit in stdout's buffer and never
+      # reach `docker-compose logs` while a scan is being debugged.
+      - PYTHONUNBUFFERED=1
+      # Ollama runs on the HOST by default — see the note in CLAUDE.md. Set
+      # OLLAMA_HOST=ollama to use the containerised one in the `ollama` profile.
+      - OLLAMA_HOST=${OLLAMA_HOST:-host.docker.internal}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.2-vision:11b}
+      - OLLAMA_ENABLED=${OLLAMA_ENABLED:-true}
+    extra_hosts:
+      # Docker Desktop provides this already; this line is what makes it work on Linux too.
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3002/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      # Only torch and the decoders load at import now — docTR is lazy and unused
+      # by /ocr, so the service is ready in seconds rather than a minute and a half.
+      start_period: 30s
     restart: unless-stopped
+
+  # Opt-in: `docker-compose --profile ollama up -d`. Off by default because a
+  # container cannot reach Apple's Metal GPU — an 11B vision model would run on
+  # CPU and take minutes per scan instead of ~30–60s.
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["ollama"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  ollama-models:

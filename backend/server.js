@@ -10,6 +10,10 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const PYTHON_OCR_URL = process.env.PYTHON_OCR_URL || 'http://localhost:3002';
 
+// Mirrors the Python service's stage order. Textract sits outside it — a crash-only
+// fallback for when the Python service is unreachable, not a low-confidence retry.
+const OCR_PIPELINE = 'PDF417 → MRZ → llama-vision → Tesseract raw text (Textract if Python is down)';
+
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
@@ -116,16 +120,29 @@ async function scanWithPython(imageBuffer, side) {
   const body = { image: imageBuffer.toString('base64') };
   if (side) body.side = side;
 
+  // Must outlast the Python side's Ollama timeout (OLLAMA_TIMEOUT, default 180s) plus the
+  // barcode/MRZ stages ahead of it — otherwise Node gives up first and the real result is lost.
+  const SCAN_TIMEOUT_MS = Number(process.env.SCAN_TIMEOUT_MS || 210000);
+
   const res = await fetch(`${PYTHON_OCR_URL}/ocr`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(120000),
+    signal: AbortSignal.timeout(SCAN_TIMEOUT_MS),
   });
 
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`Python OCR service error ${res.status}: ${text}`);
+    let detail = text;
+    try { detail = JSON.parse(text).error || text; } catch {}
+
+    // A 4xx means the *image* was rejected, not that the service is unwell. Textract is a
+    // crash-only fallback, so retrying bad input against a paid cloud OCR service would
+    // both waste the call and send the user's ID to AWS for no possible benefit.
+    const err = new Error(`Python OCR service error ${res.status}: ${detail}`);
+    err.badInput = res.status >= 400 && res.status < 500;
+    err.status = res.status;
+    throw err;
   }
 
   const ocrResult = await res.json();
@@ -133,7 +150,8 @@ async function scanWithPython(imageBuffer, side) {
 
   const rawText   = ocrResult.raw_text || '';
   const confidence = ocrResult.confidence || 0;
-  console.log(`[Python] confidence: ${typeof confidence === 'number' ? confidence.toFixed(1) : confidence}%`);
+  // Python emits a 0–1 float, not a percentage.
+  console.log(`[Python] confidence: ${typeof confidence === 'number' ? (confidence * 100).toFixed(1) + '%' : confidence}`);
   console.log(`[Python] raw text:\n${rawText}`);
 
   const f = ocrResult.fields || {};
@@ -157,7 +175,7 @@ async function scanWithPython(imageBuffer, side) {
     documentType: ocrResult.documentType || null,
   };
 
-  const source = ocrResult.source || 'doctr+passporteye+barcode';
+  const source = ocrResult.source || 'none';
   console.log('[Python] parsed fields:', JSON.stringify(data, null, 2));
   return { data, rawText, source, confidence };
 }
@@ -173,7 +191,7 @@ function logScanResult(data, source, confidence) {
   console.log(`[Node]  SCAN RESULT  (this is the Node server — Python is [PY])`);
   console.log(`[Node] ${SEP2}`);
   console.log(`[Node]  source     : ${source}`);
-  console.log(`[Node]  confidence : ${typeof confidence === 'number' ? confidence.toFixed(1) + '%' : confidence ?? '—'}`);
+  console.log(`[Node]  confidence : ${typeof confidence === 'number' ? (confidence * 100).toFixed(1) + '%' : confidence ?? '—'}`);
   console.log(`[Node] ${SEP}`);
   console.log(row('name',         data.name));
   console.log(row('dateOfBirth',  data.dateOfBirth));
@@ -188,6 +206,11 @@ function logScanResult(data, source, confidence) {
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
+
+// Browser scanner UI — open this on a phone over the ngrok HTTPS URL. Served on an
+// explicit path so `/` stays the JSON health check that the page itself probes.
+app.get('/scan', (req, res) => res.sendFile(path.join(__dirname, 'public', 'scan.html')));
+
 app.get('/', async (req, res) => {
   let pythonAlive = false;
   try {
@@ -196,8 +219,8 @@ app.get('/', async (req, res) => {
   } catch {}
   res.json({
     status: 'ID Scanner API running',
-    version: '8.0.0',
-    ocr: 'docTR+PassportEye+PDF417 → Textract field fallback → error',
+    version: '8.1.0',
+    ocr: OCR_PIPELINE,
     python_ocr: pythonAlive ? 'available' : 'unavailable',
     textract: textractAvailable() ? 'available' : 'unavailable',
   });
@@ -225,6 +248,14 @@ app.post('/api/scan', upload.single('image'), async (req, res) => {
       logScanResult(result.data, result.source, result.confidence ?? null);
       return res.json({ success: true, ...result });
     } catch (pythonErr) {
+      // Rejected image: the pipeline worked, the input was unusable. Say so and stop —
+      // no fallback can turn an undecodable upload into fields, and Textract would only
+      // send it to AWS to reach the same conclusion.
+      if (pythonErr.badInput) {
+        console.warn('[Node] Bad input, not falling back:', pythonErr.message);
+        return res.status(400).json({ error: pythonErr.message.replace(/^Python OCR service error \d+: /, '') });
+      }
+
       console.warn('[Node] Python service failed:', pythonErr.message);
 
       // ── Fallback: Textract — only if Python crashed AND creds are set ─────────
@@ -255,7 +286,7 @@ async function start() {
 ID Scanner Backend
 ━━━━━━━━━━━━━━━━━━━━━━
 Server:   http://localhost:${PORT}
-OCR:      docTR+PassportEye+PDF417 → Textract field fallback → error
+OCR:      ${OCR_PIPELINE}
 Python:   ${PYTHON_OCR_URL}
 Textract: ${textractAvailable() ? 'available' : 'unavailable (set AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY)'}
 

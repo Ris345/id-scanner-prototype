@@ -46,3 +46,7 @@ app-example
 
 # Tesseract trained data (large binary)
 *.traineddata
+
+# Python bytecode
+__pycache__/
+*.pyc

@@ -1,11 +1,33 @@
 import { Platform } from 'react-native';
+import Constants from 'expo-constants';
 import { ParsedID } from './idParser';
 
+/**
+ * In dev, resolve the backend from Metro's own host.
+ *
+ * On a physical phone `localhost` is the phone itself, so a hardcoded localhost URL can
+ * never reach the dev machine. `hostUri` is where Metro is being served from — the Mac's
+ * LAN IP — so reuse that host and swap Metro's port for the API's.
+ * Simulators and web still resolve localhost fine, hence the fallback.
+ *
+ * This only works when Metro is served over the LAN. Under `expo start --tunnel`, hostUri
+ * is an `.exp.direct` host that forwards 8081 and nothing else, so port 3001 there is dead.
+ * Tunnelled runs must set EXPO_PUBLIC_API_URL to the backend's own public URL.
+ */
+function devApiUrl(): string {
+  const override = process.env.EXPO_PUBLIC_API_URL;
+  if (override) return override.replace(/\/+$/, '');
+
+  const host = Constants.expoConfig?.hostUri?.split(':')[0];
+  if (host && /\.exp\.direct$/.test(host)) {
+    console.warn('[scanID] Metro is tunnelled but EXPO_PUBLIC_API_URL is unset — ' +
+                 'the API is not reachable through the Expo tunnel.');
+  }
+  return host ? `http://${host}:3001` : 'http://localhost:3001';
+}
+
 // Production: deployed backend on Render
-// Development: set your own backend URL below (run your own backend with your own AWS credentials)
-const API_URL = __DEV__
-  ? 'http://localhost:3001'
-  : 'https://id-scanner-prototype.onrender.com';
+const API_URL = __DEV__ ? devApiUrl() : 'https://id-scanner-prototype.onrender.com';
 
 /**
  * Send image to backend for ID extraction.
@@ -26,7 +48,12 @@ export async function scanID(imageUri: string, side?: 'front' | 'back'): Promise
   try {
     response = await fetch(`${API_URL}/api/scan`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        // Free ngrok serves an HTML interstitial to anything it reads as a browser,
+        // which would arrive here as a JSON parse failure.
+        'ngrok-skip-browser-warning': 'true',
+      },
       body: JSON.stringify(body),
     });
   } catch (networkErr) {
